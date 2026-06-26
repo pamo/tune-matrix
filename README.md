@@ -76,3 +76,17 @@ To verify the album art is what spins on the disk, render four local preview fra
 ```bash
 python spotify_matrix.py --preview-frames /tmp/spotify-matrix-preview
 ```
+
+## Live smoke test (without matrix hardware)
+
+Run this once to complete OAuth and cache a refresh token:
+
+```bash
+python spotify_matrix.py --auth-only --auth-timeout-seconds 180
+```
+
+Then run a one-frame live smoke test against Spotify's currently-playing API and write the rendered frame to disk:
+
+```bash
+python spotify_matrix.py --mock-output /tmp/spotify-matrix-smoke.png --once
+```

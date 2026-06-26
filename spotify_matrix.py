@@ -9,6 +9,7 @@ import os
 import secrets
 import threading
 import time
+import tempfile
 import urllib.parse
 import urllib.request
 from email.message import Message
@@ -47,6 +48,14 @@ class SharedPlaybackState:
     image_url: str | None = None
     image: Image.Image | None = None
     is_playing: bool = False
+
+
+@dataclass
+class RenderCache:
+    art_id: int | None = None
+    disc_size: int | None = None
+    fitted_art: Image.Image | None = None
+    disc_mask: Image.Image | None = None
 
 
 @dataclass
@@ -92,6 +101,12 @@ def raise_http_error(response: HttpResponse, context: str) -> None:
     raise RuntimeError(f"{context} failed with HTTP {response.status}: {body}")
 
 
+class SpotifyRateLimitError(RuntimeError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        self.retry_after_seconds = max(retry_after_seconds, 1)
+        super().__init__(f"Spotify API rate limited request; retry after {self.retry_after_seconds} seconds.")
+
+
 class SpotifyClient:
     def __init__(
         self,
@@ -100,37 +115,47 @@ class SpotifyClient:
         redirect_uri: str,
         token_cache: Path,
         open_browser: bool,
+        callback_timeout_seconds: float,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
         self.token_cache = token_cache
         self.open_browser = open_browser
+        self.callback_timeout_seconds = callback_timeout_seconds
         self.token = self._load_token()
 
     def get_currently_playing(self) -> dict[str, Any] | None:
-        token = self._valid_access_token()
-        response = http_request(
-            "GET",
-            CURRENTLY_PLAYING_URL,
-            params={"additional_types": "track,episode"},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
+        refreshed_token = False
+        while True:
+            token = self._valid_access_token()
+            response = http_request(
+                "GET",
+                CURRENTLY_PLAYING_URL,
+                params={"additional_types": "track,episode"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
 
-        if response.status == 204:
-            return None
-        if response.status == 401:
-            self._refresh_access_token()
-            return self.get_currently_playing()
-        if response.status == 429:
-            retry_after = int(response.headers.get("Retry-After", "5"))
-            time.sleep(max(retry_after, 1))
-            return None
-        if response.status != 200:
-            raise_http_error(response, "Spotify currently-playing request")
+            if response.status == 204:
+                return None
+            if response.status == 401:
+                if refreshed_token:
+                    raise_http_error(response, "Spotify currently-playing request")
+                self._refresh_access_token()
+                refreshed_token = True
+                continue
+            if response.status == 429:
+                retry_after_header = response.headers.get("Retry-After")
+                try:
+                    retry_after = int(retry_after_header) if retry_after_header else 5
+                except ValueError:
+                    retry_after = 5
+                raise SpotifyRateLimitError(retry_after)
+            if response.status != 200:
+                raise_http_error(response, "Spotify currently-playing request")
 
-        return response.json()
+            return response.json()
 
     def authorize(self) -> None:
         self._valid_access_token()
@@ -148,19 +173,57 @@ class SpotifyClient:
         if not self.token_cache.exists():
             return None
 
-        with self.token_cache.open("r", encoding="utf-8") as token_file:
-            return json.load(token_file)
+        try:
+            os.chmod(self.token_cache, 0o600)
+        except OSError as exc:
+            raise RuntimeError(f"Unable to secure Spotify token cache permissions: {self.token_cache}") from exc
+
+        try:
+            with self.token_cache.open("r", encoding="utf-8") as token_file:
+                return json.load(token_file)
+        except json.JSONDecodeError:
+            corrupt_path = self.token_cache.with_name(f"{self.token_cache.name}.corrupt")
+            self.token_cache.replace(corrupt_path)
+            print(
+                f"Spotify token cache was corrupt and moved to {corrupt_path}; re-authorizing.",
+                flush=True,
+            )
+            return None
 
     def _save_token(self, token: dict[str, Any]) -> None:
-        self.token_cache.parent.mkdir(parents=True, exist_ok=True)
+        self.token_cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.token_cache.parent, 0o700)
         token["expires_at"] = time.time() + int(token.get("expires_in", 3600)) - 60
 
         previous_refresh_token = self.token.get("refresh_token") if self.token else None
         if previous_refresh_token and "refresh_token" not in token:
             token["refresh_token"] = previous_refresh_token
 
-        with self.token_cache.open("w", encoding="utf-8") as token_file:
-            json.dump(token, token_file, indent=2)
+        temp_path: Path | None = None
+        replaced = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.token_cache.parent,
+                prefix=f".{self.token_cache.name}.",
+                delete=False,
+            ) as token_file:
+                temp_path = Path(token_file.name)
+                json.dump(token, token_file, indent=2)
+                token_file.flush()
+                os.fsync(token_file.fileno())
+
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self.token_cache)
+            replaced = True
+            os.chmod(self.token_cache, 0o600)
+        finally:
+            if not replaced and temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
         self.token = token
 
@@ -193,7 +256,7 @@ class SpotifyClient:
         if self.open_browser:
             webbrowser.open(auth_url)
 
-        code = callback.wait_for_code()
+        code = callback.wait_for_code(timeout_seconds=self.callback_timeout_seconds)
         token = self._post_token(
             {
                 "grant_type": "authorization_code",
@@ -282,11 +345,16 @@ class LocalCallbackServer:
 
         self.server = HTTPServer((host, port), Handler)
 
-    def wait_for_code(self) -> str:
+    def wait_for_code(self, timeout_seconds: float) -> str:
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
+        deadline = time.monotonic() + timeout_seconds
         try:
             while not self.code and not self.error and not self.state_error:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Timed out waiting for Spotify authorization callback after {timeout_seconds:.0f} seconds."
+                    )
                 time.sleep(0.1)
         finally:
             self.server.shutdown()
@@ -392,20 +460,40 @@ def download_image(url: str) -> Image.Image:
     return Image.open(BytesIO(response.content)).convert("RGB")
 
 
-def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Image:
+def render_record(
+    art: Image.Image | None,
+    angle: float,
+    size: int,
+    cache: RenderCache | None = None,
+) -> Image.Image:
     frame = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     if art is None:
         return frame.convert("RGB")
 
     margin = max(2, size // 32)
     disc_size = size - margin * 2
-    # The album art is the record surface: rotate it first, then cut it into a circular disk.
-    art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
-    rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
+    if (
+        cache
+        and cache.art_id == id(art)
+        and cache.disc_size == disc_size
+        and cache.fitted_art is not None
+        and cache.disc_mask is not None
+    ):
+        art_square = cache.fitted_art
+        disc_mask = cache.disc_mask
+    else:
+        # The album art is the record surface: rotate it first, then cut it into a circular disk.
+        art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
+        disc_mask = Image.new("L", (disc_size, disc_size), 0)
+        mask_draw = ImageDraw.Draw(disc_mask)
+        mask_draw.ellipse((0, 0, disc_size - 1, disc_size - 1), fill=255)
+        if cache:
+            cache.art_id = id(art)
+            cache.disc_size = disc_size
+            cache.fitted_art = art_square
+            cache.disc_mask = disc_mask
 
-    disc_mask = Image.new("L", (disc_size, disc_size), 0)
-    mask_draw = ImageDraw.Draw(disc_mask)
-    mask_draw.ellipse((0, 0, disc_size - 1, disc_size - 1), fill=255)
+    rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
     frame.paste(rotated.convert("RGBA"), (margin, margin), disc_mask)
 
     draw = ImageDraw.Draw(frame, "RGBA")
@@ -510,6 +598,13 @@ def poll_spotify(
             if status != last_status:
                 print(f"Spotify: {status}", flush=True)
                 last_status = status
+        except SpotifyRateLimitError as exc:
+            status = f"rate limited, retrying in {exc.retry_after_seconds}s"
+            if status != last_status:
+                print(f"Spotify: {status}", flush=True)
+                last_status = status
+            stop_event.wait(max(poll_seconds, float(exc.retry_after_seconds)))
+            continue
         except Exception as exc:
             print(f"Spotify poll failed: {exc}", flush=True)
 
@@ -545,6 +640,7 @@ def run(args: argparse.Namespace) -> None:
         redirect_uri=redirect_uri,
         token_cache=args.token_cache,
         open_browser=not args.no_browser,
+        callback_timeout_seconds=args.auth_timeout_seconds,
     )
 
     if args.auth_only:
@@ -574,6 +670,7 @@ def run(args: argparse.Namespace) -> None:
         return
 
     idle = render_idle(size)
+    render_cache = RenderCache()
     playback_state = SharedPlaybackState()
     playback_lock = threading.Lock()
     stop_event = threading.Event()
@@ -601,7 +698,7 @@ def run(args: argparse.Namespace) -> None:
             if is_playing and current_art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
 
-            image = render_record(current_art_image, angle, size) if current_art_image else idle
+            image = render_record(current_art_image, angle, size, render_cache) if current_art_image else idle
             display.show(image)
 
             if args.once:
@@ -651,6 +748,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=positive_float, default=20.0)
     parser.add_argument("--rpm", type=positive_float, default=20.0)
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
+    parser.add_argument(
+        "--auth-timeout-seconds",
+        type=positive_float,
+        default=180.0,
+        help="Maximum time to wait for Spotify callback during OAuth before failing.",
+    )
     parser.add_argument("--mock-output", type=Path, help="Write the current frame PNG instead of using RGB matrix hardware.")
     parser.add_argument("--preview-frames", type=Path, help="Render sample spinning-album-art disk frames and exit.")
     parser.add_argument("--auth-only", action="store_true", help="Authorize Spotify, cache the token, and exit without using the matrix.")
