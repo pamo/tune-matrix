@@ -1,6 +1,5 @@
 Pillow>=10.0
 python-dotenv>=1.0
-requests>=2.31
 
 # Only needed for --provider youtube-music. The code raises a clear message if it is
 # absent, so it stays optional to keep the Pi Zero install minimal.

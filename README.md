@@ -108,6 +108,11 @@ sudo -E .venv/bin/python spotify_matrix.py \
   --hardware-mapping adafruit-hat
 ```
 
+`--chain-length` and `--parallel` must both be 1. Each frame is rendered as a single
+square panel and pasted at the origin, so a chained display would leave the rest of the
+chain black. Passing anything else is rejected at startup rather than silently rendering
+a fraction of the panel.
+
 Use a specific provider:
 
 ```bash
@@ -143,6 +148,25 @@ To verify the album art is what spins on the disk, render four local preview fra
 ```bash
 python spotify_matrix.py --preview-frames /tmp/spotify-matrix-preview
 ```
+
+## Behaviour when things go wrong
+
+The script distinguishes failures it can recover from and failures it cannot, which
+matters when it runs unattended from a wall.
+
+**Fatal, exits with a message** — missing environment variables, a bad or suspended API
+key, a revoked Spotify refresh token, a missing `ytmusicapi` auth file. Retrying these
+would never succeed, so they fail loudly.
+
+**Transient, keeps running** — no network yet, DNS failure, a 5xx from the provider, or a
+rate limit. On startup the display shows the idle frame and the poll thread retries until
+the provider recovers; this is the normal case for a Pi that powers on before Wi-Fi
+associates. While running, a failed poll leaves the current album art on screen rather
+than blanking it, and repeated identical failures are logged once rather than at the poll
+rate.
+
+`--auth-only` is the exception: it fails loudly on transient errors too, because its whole
+job is to tell you whether credentials work right now.
 
 ## Live smoke test (without matrix hardware)
 
