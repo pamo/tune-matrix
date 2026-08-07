@@ -9,6 +9,7 @@ import os
 import secrets
 import threading
 import time
+import tempfile
 import urllib.parse
 import urllib.request
 from email.message import Message
@@ -17,7 +18,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from PIL import Image, ImageDraw, ImageOps
 
@@ -32,6 +33,7 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
 SCOPE = "user-read-currently-playing"
+LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
 
 
 @dataclass
@@ -47,6 +49,14 @@ class SharedPlaybackState:
     image_url: str | None = None
     image: Image.Image | None = None
     is_playing: bool = False
+
+
+@dataclass
+class RenderCache:
+    art_id: int | None = None
+    disc_size: int | None = None
+    fitted_art: Image.Image | None = None
+    disc_mask: Image.Image | None = None
 
 
 @dataclass
@@ -92,6 +102,25 @@ def raise_http_error(response: HttpResponse, context: str) -> None:
     raise RuntimeError(f"{context} failed with HTTP {response.status}: {body}")
 
 
+class ProviderRateLimitError(RuntimeError):
+    def __init__(self, provider_name: str, retry_after_seconds: int) -> None:
+        self.provider_name = provider_name
+        self.retry_after_seconds = max(retry_after_seconds, 1)
+        super().__init__(
+            f"{provider_name} API rate limited request; retry after {self.retry_after_seconds} seconds."
+        )
+
+
+class PlaybackProvider(Protocol):
+    name: str
+
+    def authorize(self) -> None:
+        ...
+
+    def get_playback_art(self) -> PlaybackArt | None:
+        ...
+
+
 class SpotifyClient:
     def __init__(
         self,
@@ -100,37 +129,51 @@ class SpotifyClient:
         redirect_uri: str,
         token_cache: Path,
         open_browser: bool,
+        callback_timeout_seconds: float,
     ) -> None:
+        self.name = "spotify"
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
         self.token_cache = token_cache
         self.open_browser = open_browser
+        self.callback_timeout_seconds = callback_timeout_seconds
         self.token = self._load_token()
 
     def get_currently_playing(self) -> dict[str, Any] | None:
-        token = self._valid_access_token()
-        response = http_request(
-            "GET",
-            CURRENTLY_PLAYING_URL,
-            params={"additional_types": "track,episode"},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
+        refreshed_token = False
+        while True:
+            token = self._valid_access_token()
+            response = http_request(
+                "GET",
+                CURRENTLY_PLAYING_URL,
+                params={"additional_types": "track,episode"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
 
-        if response.status == 204:
-            return None
-        if response.status == 401:
-            self._refresh_access_token()
-            return self.get_currently_playing()
-        if response.status == 429:
-            retry_after = int(response.headers.get("Retry-After", "5"))
-            time.sleep(max(retry_after, 1))
-            return None
-        if response.status != 200:
-            raise_http_error(response, "Spotify currently-playing request")
+            if response.status == 204:
+                return None
+            if response.status == 401:
+                if refreshed_token:
+                    raise_http_error(response, "Spotify currently-playing request")
+                self._refresh_access_token()
+                refreshed_token = True
+                continue
+            if response.status == 429:
+                retry_after_header = response.headers.get("Retry-After")
+                try:
+                    retry_after = int(retry_after_header) if retry_after_header else 5
+                except ValueError:
+                    retry_after = 5
+                raise ProviderRateLimitError(self.name, retry_after)
+            if response.status != 200:
+                raise_http_error(response, "Spotify currently-playing request")
 
-        return response.json()
+            return response.json()
+
+    def get_playback_art(self) -> PlaybackArt | None:
+        return playback_art_from_response(self.get_currently_playing())
 
     def authorize(self) -> None:
         self._valid_access_token()
@@ -148,19 +191,57 @@ class SpotifyClient:
         if not self.token_cache.exists():
             return None
 
-        with self.token_cache.open("r", encoding="utf-8") as token_file:
-            return json.load(token_file)
+        try:
+            os.chmod(self.token_cache, 0o600)
+        except OSError as exc:
+            raise RuntimeError(f"Unable to secure Spotify token cache permissions: {self.token_cache}") from exc
+
+        try:
+            with self.token_cache.open("r", encoding="utf-8") as token_file:
+                return json.load(token_file)
+        except json.JSONDecodeError:
+            corrupt_path = self.token_cache.with_name(f"{self.token_cache.name}.corrupt")
+            self.token_cache.replace(corrupt_path)
+            print(
+                f"Spotify token cache was corrupt and moved to {corrupt_path}; re-authorizing.",
+                flush=True,
+            )
+            return None
 
     def _save_token(self, token: dict[str, Any]) -> None:
-        self.token_cache.parent.mkdir(parents=True, exist_ok=True)
+        self.token_cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.token_cache.parent, 0o700)
         token["expires_at"] = time.time() + int(token.get("expires_in", 3600)) - 60
 
         previous_refresh_token = self.token.get("refresh_token") if self.token else None
         if previous_refresh_token and "refresh_token" not in token:
             token["refresh_token"] = previous_refresh_token
 
-        with self.token_cache.open("w", encoding="utf-8") as token_file:
-            json.dump(token, token_file, indent=2)
+        temp_path: Path | None = None
+        replaced = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.token_cache.parent,
+                prefix=f".{self.token_cache.name}.",
+                delete=False,
+            ) as token_file:
+                temp_path = Path(token_file.name)
+                json.dump(token, token_file, indent=2)
+                token_file.flush()
+                os.fsync(token_file.fileno())
+
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self.token_cache)
+            replaced = True
+            os.chmod(self.token_cache, 0o600)
+        finally:
+            if not replaced and temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
         self.token = token
 
@@ -193,7 +274,7 @@ class SpotifyClient:
         if self.open_browser:
             webbrowser.open(auth_url)
 
-        code = callback.wait_for_code()
+        code = callback.wait_for_code(timeout_seconds=self.callback_timeout_seconds)
         token = self._post_token(
             {
                 "grant_type": "authorization_code",
@@ -234,6 +315,152 @@ class SpotifyClient:
         if response.status != 200:
             raise_http_error(response, "Spotify token request")
         return response.json()
+
+
+class YouTubeMusicClient:
+    def __init__(self, auth_headers_path: Path) -> None:
+        self.name = "youtube-music"
+        self.auth_headers_path = auth_headers_path
+        self._client: Any | None = None
+
+    def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+
+        if not self.auth_headers_path.exists():
+            raise RuntimeError(
+                f"YouTube Music auth headers file not found at {self.auth_headers_path}. "
+                "Run ytmusicapi auth setup and set YTMUSIC_AUTH_HEADERS_PATH."
+            )
+
+        try:
+            from ytmusicapi import YTMusic
+        except ImportError as exc:
+            raise RuntimeError(
+                "The ytmusicapi package is required for provider=youtube-music. "
+                "Install dependencies with pip install -r requirements.txt."
+            ) from exc
+
+        self._client = YTMusic(str(self.auth_headers_path))
+        return self._client
+
+    def authorize(self) -> None:
+        self._get_client()
+
+    def get_playback_art(self) -> PlaybackArt | None:
+        history = self._get_client().get_history()
+        if not history:
+            return None
+
+        entry = history[0]
+        thumbnails = entry.get("thumbnails") or []
+        if not thumbnails:
+            return None
+
+        image = max(
+            thumbnails,
+            key=lambda candidate: (candidate.get("width") or 0) * (candidate.get("height") or 0),
+        )
+        image_url = image.get("url")
+        if not image_url:
+            return None
+
+        track_key = entry.get("videoId") or entry.get("title") or image_url
+        return PlaybackArt(
+            key=str(track_key),
+            image_url=str(image_url),
+            is_playing=False,
+        )
+
+
+def select_lastfm_image_url(images: list[dict[str, Any]]) -> str | None:
+    size_rank = {"small": 0, "medium": 1, "large": 2, "extralarge": 3, "mega": 4}
+    best_url: str | None = None
+    best_rank = -1
+    for image in images:
+        url = (image.get("#text") or "").strip()
+        if not url:
+            continue
+        rank = size_rank.get(image.get("size", ""), -1)
+        if rank >= best_rank:
+            best_rank = rank
+            best_url = url
+    return best_url
+
+
+class LastFmClient:
+    """Best-effort universal provider.
+
+    Last.fm reports the track a user is currently scrobbling, regardless of which
+    service plays it (Spotify, Apple Music, Tidal, Deezer, YouTube Music, ...). It is
+    free, headless, and pollable from a remote device, which makes it the catch-all for
+    services that expose no live now-playing endpoint of their own.
+    """
+
+    def __init__(self, api_key: str, user: str) -> None:
+        self.name = "lastfm"
+        self.api_key = api_key
+        self.user = user
+
+    def authorize(self) -> None:
+        # Verify the API key and username by issuing a recent-tracks request.
+        self.get_playback_art()
+
+    def get_playback_art(self) -> PlaybackArt | None:
+        response = http_request(
+            "GET",
+            LASTFM_API_URL,
+            params={
+                "method": "user.getRecentTracks",
+                "user": self.user,
+                "api_key": self.api_key,
+                "format": "json",
+                "limit": "1",
+            },
+            timeout=10,
+        )
+
+        if response.status == 429:
+            retry_after = response.headers.get("Retry-After") or ""
+            raise ProviderRateLimitError(self.name, int(retry_after) if retry_after.isdigit() else 5)
+        if response.status != 200:
+            raise_http_error(response, "Last.fm recent-tracks request")
+
+        payload = response.json()
+        error_code = payload.get("error")
+        if error_code is not None:
+            message = payload.get("message", "unknown error")
+            # 6 = user not found, 10 = invalid key, 26 = suspended key, 4 = auth failed.
+            if error_code in {4, 6, 10, 26}:
+                raise RuntimeError(
+                    f"Last.fm authorization failed ({message}). Check LASTFM_API_KEY and LASTFM_USER."
+                )
+            raise RuntimeError(f"Last.fm recent-tracks request failed: {message}")
+
+        tracks = (payload.get("recenttracks") or {}).get("track") or []
+        if isinstance(tracks, dict):
+            tracks = [tracks]
+        if not tracks:
+            return None
+
+        track = tracks[0]
+        now_playing = (track.get("@attr") or {}).get("nowplaying") == "true"
+        if not now_playing:
+            # The newest entry is a historical scrobble, not live; show idle rather
+            # than spinning a stale track forever.
+            return None
+
+        image_url = select_lastfm_image_url(track.get("image") or [])
+        if not image_url:
+            return None
+
+        artist = (track.get("artist") or {}).get("#text", "")
+        track_key = track.get("mbid") or f"{artist} - {track.get('name', '')}".strip(" -")
+        return PlaybackArt(
+            key=str(track_key) or image_url,
+            image_url=image_url,
+            is_playing=True,
+        )
 
 
 class LocalCallbackServer:
@@ -282,11 +509,16 @@ class LocalCallbackServer:
 
         self.server = HTTPServer((host, port), Handler)
 
-    def wait_for_code(self) -> str:
+    def wait_for_code(self, timeout_seconds: float) -> str:
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
+        deadline = time.monotonic() + timeout_seconds
         try:
             while not self.code and not self.error and not self.state_error:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Timed out waiting for Spotify authorization callback after {timeout_seconds:.0f} seconds."
+                    )
                 time.sleep(0.1)
         finally:
             self.server.shutdown()
@@ -392,20 +624,40 @@ def download_image(url: str) -> Image.Image:
     return Image.open(BytesIO(response.content)).convert("RGB")
 
 
-def render_record(art: Image.Image | None, angle: float, size: int) -> Image.Image:
+def render_record(
+    art: Image.Image | None,
+    angle: float,
+    size: int,
+    cache: RenderCache | None = None,
+) -> Image.Image:
     frame = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     if art is None:
         return frame.convert("RGB")
 
     margin = max(2, size // 32)
     disc_size = size - margin * 2
-    # The album art is the record surface: rotate it first, then cut it into a circular disk.
-    art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
-    rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
+    if (
+        cache
+        and cache.art_id == id(art)
+        and cache.disc_size == disc_size
+        and cache.fitted_art is not None
+        and cache.disc_mask is not None
+    ):
+        art_square = cache.fitted_art
+        disc_mask = cache.disc_mask
+    else:
+        # The album art is the record surface: rotate it first, then cut it into a circular disk.
+        art_square = ImageOps.fit(art, (disc_size, disc_size), method=Image.Resampling.LANCZOS)
+        disc_mask = Image.new("L", (disc_size, disc_size), 0)
+        mask_draw = ImageDraw.Draw(disc_mask)
+        mask_draw.ellipse((0, 0, disc_size - 1, disc_size - 1), fill=255)
+        if cache:
+            cache.art_id = id(art)
+            cache.disc_size = disc_size
+            cache.fitted_art = art_square
+            cache.disc_mask = disc_mask
 
-    disc_mask = Image.new("L", (disc_size, disc_size), 0)
-    mask_draw = ImageDraw.Draw(disc_mask)
-    mask_draw.ellipse((0, 0, disc_size - 1, disc_size - 1), fill=255)
+    rotated = art_square.rotate(angle, resample=Image.Resampling.BICUBIC)
     frame.paste(rotated.convert("RGBA"), (margin, margin), disc_mask)
 
     draw = ImageDraw.Draw(frame, "RGBA")
@@ -471,8 +723,8 @@ def render_test_pattern(size: int, offset: int) -> Image.Image:
     return frame
 
 
-def poll_spotify(
-    spotify: SpotifyClient,
+def poll_provider(
+    provider: PlaybackProvider,
     state: SharedPlaybackState,
     state_lock: threading.Lock,
     stop_event: threading.Event,
@@ -482,8 +734,7 @@ def poll_spotify(
 
     while not stop_event.is_set():
         try:
-            playback = spotify.get_currently_playing()
-            art = playback_art_from_response(playback)
+            art = provider.get_playback_art()
 
             if art:
                 with state_lock:
@@ -505,15 +756,66 @@ def poll_spotify(
                     state.image_url = None
                     state.image = None
                     state.is_playing = False
-                status = "no currently playing item"
+                status = "no playback item"
 
             if status != last_status:
-                print(f"Spotify: {status}", flush=True)
+                print(f"{provider.name}: {status}", flush=True)
                 last_status = status
+        except ProviderRateLimitError as exc:
+            status = f"rate limited, retrying in {exc.retry_after_seconds}s"
+            if status != last_status:
+                print(f"{provider.name}: {status}", flush=True)
+                last_status = status
+            stop_event.wait(max(poll_seconds, float(exc.retry_after_seconds)))
+            continue
         except Exception as exc:
-            print(f"Spotify poll failed: {exc}", flush=True)
+            print(f"{provider.name} poll failed: {exc}", flush=True)
 
         stop_event.wait(poll_seconds)
+
+
+def missing_env_vars(env_values: dict[str, str | None]) -> list[str]:
+    return [name for name, value in env_values.items() if not value]
+
+
+def build_provider(args: argparse.Namespace) -> PlaybackProvider:
+    if args.provider == "spotify":
+        spotify_env = {
+            "SPOTIFY_CLIENT_ID": os.environ.get("SPOTIFY_CLIENT_ID"),
+            "SPOTIFY_CLIENT_SECRET": os.environ.get("SPOTIFY_CLIENT_SECRET"),
+            "SPOTIFY_REDIRECT_URI": os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"),
+        }
+        missing = missing_env_vars(spotify_env)
+        if missing:
+            raise SystemExit(f"Missing required environment values: {', '.join(missing)}")
+
+        return SpotifyClient(
+            client_id=spotify_env["SPOTIFY_CLIENT_ID"] or "",
+            client_secret=spotify_env["SPOTIFY_CLIENT_SECRET"] or "",
+            redirect_uri=spotify_env["SPOTIFY_REDIRECT_URI"] or "",
+            token_cache=args.token_cache,
+            open_browser=not args.no_browser,
+            callback_timeout_seconds=args.auth_timeout_seconds,
+        )
+
+    if args.provider == "youtube-music":
+        return YouTubeMusicClient(auth_headers_path=args.ytmusic_auth_headers)
+
+    if args.provider == "lastfm":
+        lastfm_env = {
+            "LASTFM_API_KEY": os.environ.get("LASTFM_API_KEY"),
+            "LASTFM_USER": os.environ.get("LASTFM_USER"),
+        }
+        missing = missing_env_vars(lastfm_env)
+        if missing:
+            raise SystemExit(f"Missing required environment values: {', '.join(missing)}")
+
+        return LastFmClient(
+            api_key=lastfm_env["LASTFM_API_KEY"] or "",
+            user=lastfm_env["LASTFM_USER"] or "",
+        )
+
+    raise RuntimeError(f"Unsupported provider: {args.provider}")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -523,33 +825,20 @@ def run(args: argparse.Namespace) -> None:
 
     load_dotenv()
 
-    client_id = os.environ.get("SPOTIFY_CLIENT_ID")
-    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
-    redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+    provider = build_provider(args)
 
-    missing = [
-        name
-        for name, value in (
-            ("SPOTIFY_CLIENT_ID", client_id),
-            ("SPOTIFY_CLIENT_SECRET", client_secret),
-            ("SPOTIFY_REDIRECT_URI", redirect_uri),
-        )
-        if not value
-    ]
-    if missing:
-        raise SystemExit(f"Missing required environment values: {', '.join(missing)}")
-
-    spotify = SpotifyClient(
-        client_id=client_id or "",
-        client_secret=client_secret or "",
-        redirect_uri=redirect_uri,
-        token_cache=args.token_cache,
-        open_browser=not args.no_browser,
-    )
+    try:
+        provider.authorize()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if args.auth_only:
-        spotify.authorize()
-        print(f"Spotify token cached at {args.token_cache}")
+        if args.provider == "spotify":
+            print(f"Spotify token cached at {args.token_cache}")
+        elif args.provider == "youtube-music":
+            print(f"YouTube Music auth headers verified at {args.ytmusic_auth_headers}")
+        elif args.provider == "lastfm":
+            print("Last.fm API key and user verified.")
         return
 
     display: MatrixDisplay | MockDisplay
@@ -574,12 +863,13 @@ def run(args: argparse.Namespace) -> None:
         return
 
     idle = render_idle(size)
+    render_cache = RenderCache()
     playback_state = SharedPlaybackState()
     playback_lock = threading.Lock()
     stop_event = threading.Event()
     poll_thread = threading.Thread(
-        target=poll_spotify,
-        args=(spotify, playback_state, playback_lock, stop_event, args.poll_seconds),
+        target=poll_provider,
+        args=(provider, playback_state, playback_lock, stop_event, args.poll_seconds),
         daemon=True,
     )
     poll_thread.start()
@@ -601,7 +891,7 @@ def run(args: argparse.Namespace) -> None:
             if is_playing and current_art_image is not None:
                 angle = (angle - 360.0 * (args.rpm / 60.0) * delta) % 360.0
 
-            image = render_record(current_art_image, angle, size) if current_art_image else idle
+            image = render_record(current_art_image, angle, size, render_cache) if current_art_image else idle
             display.show(image)
 
             if args.once:
@@ -632,7 +922,13 @@ def render_preview_frames(directory: Path) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Spin Spotify album art on a 64x64 RGB matrix.")
+    parser = argparse.ArgumentParser(description="Spin currently playing album art on a 64x64 RGB matrix.")
+    parser.add_argument(
+        "--provider",
+        choices=("spotify", "youtube-music", "lastfm"),
+        default="spotify",
+        help="Music provider to use for album art.",
+    )
     parser.add_argument("--rows", type=int, default=64)
     parser.add_argument("--cols", type=int, default=64)
     parser.add_argument("--chain-length", type=int, default=1)
@@ -651,12 +947,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=positive_float, default=20.0)
     parser.add_argument("--rpm", type=positive_float, default=20.0)
     parser.add_argument("--token-cache", type=Path, default=Path(".cache/spotify_token.json"))
+    parser.add_argument(
+        "--ytmusic-auth-headers",
+        type=Path,
+        default=Path(os.environ.get("YTMUSIC_AUTH_HEADERS_PATH", ".cache/ytmusic_auth.json")),
+        help="Path to ytmusicapi auth headers JSON file for YouTube Music provider.",
+    )
+    parser.add_argument(
+        "--auth-timeout-seconds",
+        type=positive_float,
+        default=180.0,
+        help="Maximum time to wait for Spotify OAuth callback before failing.",
+    )
     parser.add_argument("--mock-output", type=Path, help="Write the current frame PNG instead of using RGB matrix hardware.")
     parser.add_argument("--preview-frames", type=Path, help="Render sample spinning-album-art disk frames and exit.")
-    parser.add_argument("--auth-only", action="store_true", help="Authorize Spotify, cache the token, and exit without using the matrix.")
-    parser.add_argument("--test-pattern", action="store_true", help="Show a bright moving color test pattern without using Spotify.")
+    parser.add_argument(
+        "--auth-only",
+        action="store_true",
+        help="Authorize/verify provider credentials and exit without using the matrix.",
+    )
+    parser.add_argument("--test-pattern", action="store_true", help="Show a bright moving color test pattern.")
     parser.add_argument("--once", action="store_true", help="Render one frame and exit.")
-    parser.add_argument("--no-browser", action="store_true", help="Print the Spotify auth URL without trying to open a browser.")
+    parser.add_argument("--no-browser", action="store_true", help="Print Spotify auth URL without trying to open a browser.")
     return parser
 
 
