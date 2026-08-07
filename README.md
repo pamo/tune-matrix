@@ -218,7 +218,7 @@ becomes abstract colour fields. Check yours before committing to the panel:
 
 ```bash
 python tune_matrix.py --scene photos --photos ~/Pictures/test --preview-terminal
-python tune_matrix.py --scene photos --photos ~/Pictures/test \\
+python tune_matrix.py --scene photos --photos ~/Pictures/test \
   --mock-output /tmp/p.png --preview-scale 10 --preview-grid --once
 ```
 
