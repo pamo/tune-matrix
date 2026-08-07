@@ -18,6 +18,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from PIL import Image, ImageDraw, ImageOps
@@ -325,10 +326,28 @@ class SpotifyClient:
 
 
 class YouTubeMusicClient:
-    def __init__(self, auth_headers_path: Path) -> None:
+    """Best-effort provider built on playback *history*.
+
+    YouTube Music exposes no live now-playing endpoint, so "is it playing?" is inferred
+    from freshness: when the top history entry changes, the track is treated as playing
+    and keeps spinning until `stale_after_seconds` passes with no further change. A track
+    already at the top of history when the process starts counts as a change, so expect
+    one stale spin window after a restart.
+    """
+
+    def __init__(
+        self,
+        auth_headers_path: Path,
+        stale_after_seconds: float = 600.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.name = "youtube-music"
         self.auth_headers_path = auth_headers_path
+        self.stale_after_seconds = stale_after_seconds
+        self._clock = clock
         self._client: Any | None = None
+        self._last_key: str | None = None
+        self._last_change_at: float | None = None
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -372,11 +391,17 @@ class YouTubeMusicClient:
         if not image_url:
             return None
 
-        track_key = entry.get("videoId") or entry.get("title") or image_url
+        track_key = str(entry.get("videoId") or entry.get("title") or image_url)
+
+        now = self._clock()
+        if track_key != self._last_key or self._last_change_at is None:
+            self._last_key = track_key
+            self._last_change_at = now
+
         return PlaybackArt(
-            key=str(track_key),
+            key=track_key,
             image_url=str(image_url),
-            is_playing=False,
+            is_playing=(now - self._last_change_at) <= self.stale_after_seconds,
         )
 
 
@@ -808,7 +833,10 @@ def build_provider(args: argparse.Namespace) -> PlaybackProvider:
         )
 
     if args.provider == "youtube-music":
-        return YouTubeMusicClient(auth_headers_path=args.ytmusic_auth_headers)
+        return YouTubeMusicClient(
+            auth_headers_path=args.ytmusic_auth_headers,
+            stale_after_seconds=args.ytmusic_stale_seconds,
+        )
 
     if args.provider == "lastfm":
         lastfm_env = {
@@ -961,6 +989,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(os.environ.get("YTMUSIC_AUTH_HEADERS_PATH", ".cache/ytmusic_auth.json")),
         help="Path to ytmusicapi auth headers JSON file for YouTube Music provider.",
+    )
+    parser.add_argument(
+        "--ytmusic-stale-seconds",
+        type=positive_float,
+        default=600.0,
+        help=(
+            "How long a YouTube Music history entry keeps spinning after it last changed. "
+            "History has no live playing flag, so this bounds how long a finished track spins."
+        ),
     )
     parser.add_argument(
         "--auth-timeout-seconds",

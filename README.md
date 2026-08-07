@@ -15,9 +15,19 @@ Supported providers:
 ## Files
 
 - `spotify_matrix.py` - Pi runtime script.
+- `test_spotify_matrix.py` - unit tests (stdlib `unittest`, no extra packages).
 - `.env` - local provider credentials, ignored by Git.
 - `.env.example` - template for recreating local config.
 - `requirements.txt` - Python dependencies, excluding the hardware-specific RGB matrix bindings.
+
+## Tests
+
+```bash
+python -m unittest -v
+```
+
+No network, no real clock, no matrix hardware, and no dependencies beyond Pillow, so this
+runs on the Pi as well as a laptop.
 
 ## Raspberry Pi setup
 
@@ -226,6 +236,19 @@ Uses [`ytmusicapi`](https://github.com/sigma67/ytmusicapi) to read playback **hi
 (an unofficial API backed by browser auth headers). It works headless, but it reads the most
 recent history entry rather than a true live "now playing" signal, and unofficial endpoints
 can break without notice.
+
+Because history carries no "is it playing" flag, playback state is inferred from
+**freshness**: when the top history entry changes, the record starts spinning and keeps
+spinning until `--ytmusic-stale-seconds` (default 600) passes with no further change. Two
+consequences worth knowing:
+
+- A track already sitting at the top of history when the process starts counts as a change,
+  so expect one stale spin window after a restart.
+- A long track will stop spinning before it ends if it outlasts the window. Raise
+  `--ytmusic-stale-seconds` to trade a longer stale spin for fewer false stops.
+
+If you want an accurate playing/paused signal, use `--provider lastfm` instead — it has a
+real live `nowplaying` flag.
 
 ### Provider summary
 
