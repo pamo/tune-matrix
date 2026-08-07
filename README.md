@@ -1,9 +1,10 @@
 # Tune Matrix
 
-Shows current album art on a 64x64 RGB matrix, either as a spinning record or as static
-full-bleed art (see [Display style](#display-style)). In the default record style the album
-art is the record surface itself: cropped to a disk, spun while playback is active, and
-left stopped at the current angle when paused.
+Shows current album art on a 64x64 RGB matrix as a spinning record or as static full-bleed
+art, and can fall back to a clock or your own photos when nothing is playing (see
+[Scenes](#scenes)). In the default record style the album art is the record surface itself:
+cropped to a disk, spun while playback is active, and left stopped at the current angle when
+paused. Settings are changed from a phone-friendly [web UI](#web-ui) served by the Pi.
 
 You do not need the panel to work on this — see
 [Previewing without a matrix](#previewing-without-a-matrix) for a live terminal preview, GIF
@@ -26,6 +27,8 @@ Supported providers:
 - `tune_matrix.py` - Pi runtime script.
 - `test_tune_matrix.py` - unit tests (stdlib `unittest`, no extra packages).
 - `.env` - local provider credentials, ignored by Git.
+- `config.json` - runtime settings, hot-reloaded. Written on first run, ignored by Git.
+- `photos/` - images for the photo scenes, ignored by Git.
 - `.env.example` - template for recreating local config.
 - `requirements.txt` - Python dependencies, excluding the hardware-specific RGB matrix bindings.
 
@@ -161,21 +164,115 @@ credentials and makes no network calls, so it is the first thing to run on a fre
 sudo -E .venv/bin/python tune_matrix.py --test-pattern
 ```
 
-## Display style
+## Scenes
 
-`--style` picks what the panel shows:
+A **scene** is what the panel shows. Album scenes follow playback; the rest stand alone,
+which is what makes a useful idle state possible.
 
-| Style | What you get |
+| Scene | What you get |
 | --- | --- |
-| `record` (default) | Album art cut into a circular disc that spins while playback is active, with a centre label and spindle hole. |
-| `art` | Album art static and full-bleed, edge to edge. No disc, no rotation. |
+| `album` | Album art, drawn in the current style (below). |
+| `blank` | A dim ring and centre dot. The original idle frame. |
+| `clock` | The time in large pixel digits. |
+| `photos` | A slideshow of your own images. |
+| `photos+clock` | The slideshow with the time drawn over it. |
+
+Normally the scene follows playback: album art while something plays, and your chosen
+**idle scene** when nothing does. You can also pin one scene permanently.
+
+| Album art style | What you get |
+| --- | --- |
+| `record` (default) | Art cut into a circular disc that spins while playback is active, with a centre label and spindle hole. |
+| `art` | Art static and full-bleed, edge to edge. No disc, no rotation. |
+
+`art` does no per-frame work at all, so `--fps 2` is plenty and saves CPU on a Pi Zero.
+`--rpm` only affects `record`.
+
+### The clock
+
+Drawn from a hand-made bitmap font rather than a TrueType one: at 64px any antialiasing
+just smears the strokes, and integer scaling of a 5x7 grid keeps every stroke exactly one
+pixel. Digits sit in fixed-width cells so the time does not shuffle sideways as it changes.
+
+Over a photo the digits get a 1px black halo, which keeps white text readable on a pale
+image while hiding far less of the picture than a dark box would.
+
+Time comes from NTP over Wi-Fi, so there is no RTC to set — but after a power cut the clock
+is wrong until Wi-Fi reassociates. If that matters, an I²C RTC would fit: SCL and SDA are
+free on the bonnet.
+
+### Photos
+
+Put images in the `--photos` directory (`photos/` by default; PNG, JPEG, GIF, BMP or WebP):
 
 ```bash
-sudo -E .venv/bin/python tune_matrix.py --style art
+scp ~/Pictures/holiday/*.jpg pi@raspberrypi.local:~/tune-matrix/photos/
 ```
 
-`--style art` does no per-frame work at all, so `--fps 2` is plenty and saves CPU on a
-Pi Zero. `--rpm` only affects `record`.
+They are re-scanned when the directory changes, so new photos need no restart. Decoding and
+downscaling happens on a background thread — a phone photo takes far longer than a frame
+budget on a Pi Zero, so it must never happen on the frame path.
+
+Be warned that 64x64 is **brutally** lo-fi. A tight crop of a face reads; a landscape
+becomes abstract colour fields. Check yours before committing to the panel:
+
+```bash
+python tune_matrix.py --photos ~/Pictures/test --preview-terminal
+python tune_matrix.py --photos ~/Pictures/test --mock-output /tmp/p.png --preview-scale 10 --preview-grid --once
+```
+
+## Changing settings while it runs
+
+`config.json` is the single source of truth for everything adjustable at runtime, and it is
+re-read whenever it changes. That makes every way of changing settings equivalent — the web
+UI, an SSH edit, or anything else that writes the file.
+
+### Web UI
+
+The Pi serves a phone-friendly control page. Open it from the couch:
+
+```text
+http://raspberrypi.local:8080
+```
+
+Pick the scene, the album art style, the idle scene, 12/24 hour, brightness, record speed
+and photo interval. It shows what is currently on the panel — scene, provider, playback
+state, track and current photo — so you can confirm a change landed.
+
+It is deliberately narrow: three fixed routes, **no filesystem serving of any kind**, and
+every write goes through the same validation as the file, so a hostile value is clamped
+rather than obeyed. It is built on stdlib `http.server`, adding no dependencies.
+
+There is **no authentication** — anyone on your network can change your display. That is the
+usual bargain for a home device, but it is a real choice:
+
+```bash
+tune_matrix.py --web-host 127.0.0.1   # only reachable from the Pi itself (use an SSH tunnel)
+tune_matrix.py --web-port 0           # no server at all
+```
+
+Bounded renders (`--once`, `--record-gif`) never start it, so a preview cannot collide with
+the port of a display already running.
+
+### Command line and SSH
+
+Any setting also has a flag. **An explicit flag wins over `config.json` and is written back
+to it**, so a flag can never silently do nothing just because the file disagreed, and the
+web UI never shows something different from what is on the panel:
+
+```bash
+tune_matrix.py --style art --idle-scene photos+clock --clock-24-hour
+```
+
+Or edit the file directly; the display picks it up within a frame:
+
+```bash
+ssh pi@raspberrypi.local
+vi ~/tune-matrix/config.json
+```
+
+A malformed file is not fatal — it keeps the last good settings and says so, because a wall
+clock that refuses to start over a typo is worse than one that ignores it.
 
 ## Previewing without a matrix
 

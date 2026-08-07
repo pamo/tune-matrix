@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from email.message import Message
 from http.server import HTTPServer
 from pathlib import Path
@@ -1281,49 +1282,90 @@ class TestAdvanceAngle(unittest.TestCase):
         self.assertAlmostEqual(sm.advance_angle(0.0, 20.0, 3.0) % 360.0, 0.0, places=6)
 
 
-class TestRecordFrameSource(unittest.TestCase):
+def stub_config(**overrides):
+    """A ConfigStore backed by a path that does not exist, so it always yields defaults."""
+    return sm.ConfigStore(Path("/nonexistent/config.json"), defaults=sm.Config(**overrides))
+
+
+class TestAlbumScene(unittest.TestCase):
     def setUp(self):
-        self.renderer = sm.RecordRenderer(64)
+        self.renderers = {name: sm.build_renderer(name, 64) for name in sm.RENDERER_STYLES}
         self.state = sm.PlaybackState()
 
-    def source(self, rpm=20.0):
-        return sm.RecordFrameSource(self.renderer, self.state, rpm, start_time=0.0)
+    def scene(self, style="record", rpm=20.0, start_time=0.0):
+        return sm.AlbumScene(
+            self.renderers, self.state, stub_config(style=style, rpm=rpm), start_time=start_time
+        )
+
+    def renderer(self, style="record"):
+        return self.renderers[style]
+
+    def play(self, colour=(255, 0, 0), is_playing=True, style="record"):
+        self.state.update(
+            sm.PlaybackArt("k", "u", is_playing), self.renderer(style).fit(art_image(colour))
+        )
 
     def test_shows_idle_when_there_is_no_art(self):
-        self.assertIs(self.source()(1.0), self.renderer.idle())
+        self.assertIs(self.scene().frame(1.0), self.renderer().idle())
 
     def test_first_frame_does_not_jump_the_angle(self):
-        self.state.update(sm.PlaybackArt("k", "u", True), self.renderer.fit(art_image()))
-        source = sm.RecordFrameSource(self.renderer, self.state, 20.0)
+        self.play()
+        scene = sm.AlbumScene(self.renderers, self.state, stub_config())
         # 7.3 is deliberately not a whole number of revolutions at 20 rpm: treating the
         # monotonic clock's absolute value as elapsed time would land on 156 degrees.
-        source(7.3)
-        self.assertEqual(source.angle, 0.0, "elapsed time before the first frame is not real")
+        scene.frame(7.3)
+        self.assertEqual(scene.angle, 0.0, "elapsed time before the first frame is not real")
 
     def test_angle_advances_while_playing(self):
-        self.state.update(sm.PlaybackArt("k", "u", True), self.renderer.fit(art_image()))
-        source = self.source()
-        source(1.0)
-        self.assertAlmostEqual(source.angle, 240.0)
+        self.play()
+        scene = self.scene()
+        scene.frame(1.0)
+        self.assertAlmostEqual(scene.angle, 240.0)
 
     def test_angle_frozen_while_paused(self):
-        self.state.update(sm.PlaybackArt("k", "u", False), self.renderer.fit(art_image()))
-        source = self.source()
-        source(1.0)
-        source(2.0)
-        self.assertEqual(source.angle, 0.0)
+        self.play(is_playing=False)
+        scene = self.scene()
+        scene.frame(1.0)
+        scene.frame(2.0)
+        self.assertEqual(scene.angle, 0.0)
 
     def test_paused_art_still_renders(self):
-        self.state.update(sm.PlaybackArt("k", "u", False), self.renderer.fit(art_image((255, 0, 0))))
-        frame = self.source()(1.0)
-        self.assertEqual(frame.getpixel((16, 32)), (255, 0, 0))
+        self.play(is_playing=False)
+        self.assertEqual(self.scene().frame(1.0).getpixel((16, 32)), (255, 0, 0))
 
     def test_returns_to_idle_when_art_is_cleared(self):
-        self.state.update(sm.PlaybackArt("k", "u", True), self.renderer.fit(art_image()))
-        source = self.source()
-        source(1.0)
+        self.play()
+        scene = self.scene()
+        scene.frame(1.0)
         self.state.clear()
-        self.assertIs(source(2.0), self.renderer.idle())
+        self.assertIs(scene.frame(2.0), self.renderer().idle())
+
+    def test_style_comes_from_the_config_not_the_constructor(self):
+        self.play(colour=(0, 0, 255), style="art")
+        record = self.scene(style="record").frame(1.0)
+        art = self.scene(style="art").frame(1.0)
+        self.assertEqual(record.getpixel((0, 0)), (0, 0, 0), "record leaves a black margin")
+        self.assertEqual(art.getpixel((0, 0)), (0, 0, 255), "art fills the panel")
+
+    def test_rpm_comes_from_the_config(self):
+        self.play()
+        scene = self.scene(rpm=60.0)
+        scene.frame(1.0)
+        self.assertAlmostEqual(scene.angle, 0.0, places=6)  # 60 rpm for 1s is a full turn
+
+    def test_static_style_does_not_advance_the_angle(self):
+        self.play(style="art")
+        scene = self.scene(style="art")
+        scene.frame(1.0)
+        scene.frame(2.0)
+        self.assertEqual(scene.angle, 0.0, "no point spinning art that is not a disc")
+
+    def test_tolerates_art_fitted_for_the_other_style(self):
+        # A style change leaves art sized for the previous renderer until the next poll.
+        self.play(colour=(0, 255, 0), style="record")
+        frame = self.scene(style="art").frame(1.0)
+        self.assertEqual(frame.size, (64, 64))
+        self.assertNotEqual(frame.getpixel((0, 0)), (0, 0, 0))
 
 
 class TestTestPatternFrameSource(unittest.TestCase):
@@ -1706,13 +1748,20 @@ class StubProvider:
 
 
 class TestRunStartup(unittest.TestCase):
+    def isolated(self):
+        return ["--config", str(Path(self.tmp.name) / "config.json")]
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.output = Path(self.tmp.name) / "frame.png"
 
     def run_with(self, provider, extra_argv=()):
-        argv = ["--mock-output", str(self.output), "--once", *extra_argv]
+        argv = [
+            "--mock-output", str(self.output), "--once",
+            "--config", str(Path(self.tmp.name) / "config.json"),
+            *extra_argv,
+        ]
         args = sm.build_parser().parse_args(argv)
         with mock.patch.object(sm, "build_provider", return_value=provider), \
              mock.patch.object(sm, "download_image", return_value=art_image(size=(64, 64))), \
@@ -1753,7 +1802,7 @@ class TestRunStartup(unittest.TestCase):
             ("demo", "no credentials"),
         ]:
             with self.subTest(provider=provider_name):
-                args = sm.build_parser().parse_args(["--provider", provider_name, "--auth-only"])
+                args = sm.build_parser().parse_args(["--provider", provider_name, "--auth-only", *self.isolated()])
                 buffer = io.StringIO()
                 with mock.patch.object(sm, "build_provider", return_value=StubProvider()), \
                      mock.patch.object(sm, "load_dotenv"), \
@@ -1766,7 +1815,7 @@ class TestRunStartup(unittest.TestCase):
 
     def test_test_pattern_needs_no_provider_at_all(self):
         args = sm.build_parser().parse_args(
-            ["--test-pattern", "--mock-output", str(self.output), "--once"]
+            ["--test-pattern", "--mock-output", str(self.output), "--once", *self.isolated()]
         )
         with mock.patch.object(sm, "build_provider", side_effect=AssertionError("no provider")), \
              mock.patch.object(sm, "load_dotenv"), quiet():
@@ -1775,7 +1824,7 @@ class TestRunStartup(unittest.TestCase):
 
     def test_test_pattern_honours_once(self):
         args = sm.build_parser().parse_args(
-            ["--test-pattern", "--mock-output", str(self.output), "--once"]
+            ["--test-pattern", "--mock-output", str(self.output), "--once", *self.isolated()]
         )
         display = RecordingDisplay()
         with mock.patch.object(sm, "build_display", return_value=display), \
@@ -1787,7 +1836,9 @@ class TestRunStartup(unittest.TestCase):
     def test_display_is_cleared_when_the_poll_thread_cannot_start(self):
         """Cleanup must be registered before the thread, or the panel keeps the last frame."""
         display = RecordingDisplay()
-        args = sm.build_parser().parse_args(["--mock-output", str(self.output), "--once"])
+        args = sm.build_parser().parse_args(
+            ["--mock-output", str(self.output), "--once", *self.isolated()]
+        )
         with mock.patch.object(sm, "build_provider", return_value=StubProvider()), \
              mock.patch.object(sm, "build_display", return_value=display), \
              mock.patch.object(sm, "load_dotenv"), \
@@ -1798,14 +1849,14 @@ class TestRunStartup(unittest.TestCase):
         self.assertEqual(display.cleared, 1)
 
     def test_chained_panel_config_is_rejected_before_touching_hardware(self):
-        args = sm.build_parser().parse_args(["--chain-length", "2"])
+        args = sm.build_parser().parse_args(["--chain-length", "2", *self.isolated()])
         with mock.patch.object(sm, "build_display", side_effect=AssertionError("no display")):
             with self.assertRaises(SystemExit):
                 sm.run(args)
 
     def test_preview_frames_needs_no_credentials_or_validation(self):
         directory = Path(self.tmp.name) / "preview"
-        args = sm.build_parser().parse_args(["--preview-frames", str(directory)])
+        args = sm.build_parser().parse_args(["--preview-frames", str(directory), *self.isolated()])
         with mock.patch.object(sm, "build_provider", side_effect=AssertionError("no provider")):
             sm.run(args)
         self.assertEqual(len(list(directory.iterdir())), 4)
@@ -1881,24 +1932,10 @@ class TestRendererStyles(unittest.TestCase):
     def test_cli_choices_match_the_style_table(self):
         action = next(a for a in sm.build_parser()._actions if a.dest == "style")
         self.assertEqual(set(action.choices), set(sm.RENDERER_STYLES))
-        self.assertEqual(sm.build_parser().parse_args([]).style, "record")
+        # None means "leave config.json alone"; the effective default lives in Config.
+        self.assertIsNone(sm.build_parser().parse_args([]).style)
+        self.assertEqual(sm.Config().style, "record")
 
-    def test_static_style_does_not_advance_the_angle(self):
-        renderer = sm.build_renderer("art", 64)
-        state = sm.PlaybackState()
-        state.update(sm.PlaybackArt("k", "u", True), renderer.fit(art_image()))
-        source = sm.RecordFrameSource(renderer, state, 20.0, start_time=0.0)
-        source(1.0)
-        source(2.0)
-        self.assertEqual(source.angle, 0.0, "no point spinning art that is not a disc")
-
-    def test_record_style_does_advance_the_angle(self):
-        renderer = sm.build_renderer("record", 64)
-        state = sm.PlaybackState()
-        state.update(sm.PlaybackArt("k", "u", True), renderer.fit(art_image()))
-        source = sm.RecordFrameSource(renderer, state, 20.0, start_time=0.0)
-        source(1.0)
-        self.assertNotEqual(source.angle, 0.0)
 
 
 class TestRenderPreviewFramesStyles(unittest.TestCase):
@@ -2509,21 +2546,21 @@ class TestBuildImagePreparer(unittest.TestCase):
         args = sm.build_parser().parse_args(["--provider", "demo"])
         renderer = sm.build_renderer("record", 64)
         with mock.patch.object(sm, "download_image", side_effect=AssertionError("no network")):
-            image = sm.build_image_preparer(args, renderer)(sm.DemoProvider.DEMO_IMAGE_URL)
+            image = sm.build_image_preparer(args, lambda: renderer)(sm.DemoProvider.DEMO_IMAGE_URL)
         self.assertEqual(image.size, (renderer.disc_size,) * 2)
 
     def test_real_provider_downloads_and_fits(self):
         args = sm.build_parser().parse_args([])
         renderer = sm.build_renderer("record", 64)
         with mock.patch.object(sm, "download_image", return_value=art_image(size=(640, 640))) as dl:
-            image = sm.build_image_preparer(args, renderer)("https://art/a.png")
+            image = sm.build_image_preparer(args, lambda: renderer)("https://art/a.png")
         dl.assert_called_once_with("https://art/a.png")
         self.assertEqual(image.size, (renderer.disc_size,) * 2)
 
     def test_fits_to_the_active_style(self):
         args = sm.build_parser().parse_args(["--provider", "demo"])
         art_renderer = sm.build_renderer("art", 64)
-        image = sm.build_image_preparer(args, art_renderer)("x")
+        image = sm.build_image_preparer(args, lambda: art_renderer)("x")
         self.assertEqual(image.size, (64, 64), "static art fills the panel, not just the disc")
 
 
@@ -2590,14 +2627,20 @@ class TestPlaybackStateFirstUpdate(unittest.TestCase):
 class TestPreviewEndToEnd(unittest.TestCase):
     """The whole point: see what the panel would show, with no panel."""
 
+    def isolated(self):
+        return ["--config", str(self.dir / "config.json")]
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
 
     def run_cli(self, argv):
+        # Always isolate config.json: it persists by design, so a shared one would leak
+        # settings between tests (and into the repo).
+        isolated = ["--config", str(self.dir / "config.json"), "--photos", str(self.dir / "photos")]
         with quiet():
-            sm.run(sm.build_parser().parse_args(argv))
+            sm.run(sm.build_parser().parse_args([*argv, *isolated]))
 
     def test_demo_provider_renders_real_art_not_the_idle_frame(self):
         output = self.dir / "f.png"
@@ -2642,13 +2685,13 @@ class TestPreviewEndToEnd(unittest.TestCase):
         """run() must wire the status callable through, or the HUD is empty."""
         stream = io.StringIO()
         args = sm.build_parser().parse_args(
-            ["--provider", "demo", "--style", "art", "--preview-terminal", "--once"]
+            ["--provider", "demo", "--style", "art", "--preview-terminal", "--once", *self.isolated()]
         )
         real = sm.TerminalDisplay
         factory = lambda **kwargs: real(stream=stream, terminal_size=(200, 60), **kwargs)
         with mock.patch.object(sm, "TerminalDisplay", factory), quiet():
             sm.run(args)
-        self.assertIn("demo · art · playing · Demo Artist - Demo Track", stream.getvalue())
+        self.assertIn("demo · album:art · playing · Demo Artist - Demo Track", stream.getvalue())
 
     def test_scaled_grid_preview_is_written_at_the_requested_size(self):
         output = self.dir / "big.png"
@@ -2664,6 +2707,871 @@ class TestPreviewEndToEnd(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.run_cli(["--provider", "demo", "--mock-output", str(output), "--once"])
         self.assertTrue(output.exists())
+
+
+# ======================================================================================
+# Runtime settings
+# ======================================================================================
+
+
+class TestCoerceConfig(unittest.TestCase):
+    def test_empty_input_gives_defaults(self):
+        self.assertEqual(sm.coerce_config({}), sm.Config())
+
+    def test_round_trips_through_as_dict(self):
+        config = sm.Config(style="art", idle_scene="clock", override_scene="photos", rpm=45.0)
+        self.assertEqual(sm.coerce_config(config.as_dict()), config)
+
+    def test_unknown_keys_are_ignored(self):
+        self.assertEqual(sm.coerce_config({"nonsense": True, "style": "art"}).style, "art")
+
+    def test_bad_style_falls_back_instead_of_raising(self):
+        # A wall clock that refuses to start over a typo is worse than one that ignores it.
+        self.assertEqual(sm.coerce_config({"style": "hologram"}).style, sm.Config().style)
+
+    def test_bad_scene_names_fall_back(self):
+        self.assertEqual(sm.coerce_config({"idle_scene": "lava-lamp"}).idle_scene, "blank")
+        self.assertIsNone(sm.coerce_config({"override_scene": "lava-lamp"}).override_scene)
+
+    def test_override_sentinels_mean_follow_playback(self):
+        for value in ("", "none", "auto", None):
+            with self.subTest(value=value):
+                self.assertIsNone(sm.coerce_config({"override_scene": value}).override_scene)
+
+    def test_every_scene_name_is_accepted_as_an_override(self):
+        for scene in sm.SCENE_NAMES:
+            with self.subTest(scene=scene):
+                self.assertEqual(sm.coerce_config({"override_scene": scene}).override_scene, scene)
+
+    def test_numbers_are_clamped_not_rejected(self):
+        self.assertEqual(sm.coerce_config({"rpm": 10_000}).rpm, 300.0)
+        self.assertEqual(sm.coerce_config({"rpm": -5}).rpm, 0.1)
+        self.assertEqual(sm.coerce_config({"photo_seconds": 0}).photo_seconds, 1.0)
+        self.assertEqual(sm.coerce_config({"brightness": 500}).brightness, 100)
+        self.assertEqual(sm.coerce_config({"brightness": 0}).brightness, 1)
+
+    def test_unparseable_numbers_fall_back(self):
+        self.assertEqual(sm.coerce_config({"rpm": "fast"}).rpm, sm.Config().rpm)
+        self.assertEqual(sm.coerce_config({"brightness": "bright"}).brightness, None)
+
+    def test_null_brightness_means_leave_as_launched(self):
+        self.assertIsNone(sm.coerce_config({"brightness": None}).brightness)
+
+    def test_supplied_defaults_are_the_fallback(self):
+        defaults = sm.Config(style="art", rpm=99.0)
+        coerced = sm.coerce_config({"style": "nope", "rpm": "nope"}, defaults)
+        self.assertEqual((coerced.style, coerced.rpm), ("art", 99.0))
+
+
+class TestConfigStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "config.json"
+        self.store = sm.ConfigStore(self.path)
+
+    def test_missing_file_yields_defaults(self):
+        self.assertEqual(self.store.current(), sm.Config())
+
+    def test_save_then_read_back(self):
+        self.store.save(sm.Config(style="art", idle_scene="clock"))
+        self.assertEqual(sm.ConfigStore(self.path).current().style, "art")
+
+    def test_written_file_is_readable_json(self):
+        self.store.save(sm.Config(rpm=33.0))
+        self.assertEqual(json.loads(self.path.read_text())["rpm"], 33.0)
+
+    def test_picks_up_an_external_edit(self):
+        """An SSH edit and the web UI must be equivalent."""
+        self.store.save(sm.Config(style="record"))
+        self.assertEqual(self.store.current().style, "record")
+        self.path.write_text(json.dumps({"style": "art"}), encoding="utf-8")
+        self.assertEqual(self.store.current().style, "art")
+
+    def test_unchanged_file_is_not_re_parsed(self):
+        self.store.save(sm.Config())
+        first = self.store.current()
+        self.assertIs(self.store.current(), first, "should be cached between stats")
+
+    def test_corrupt_file_keeps_the_last_good_settings(self):
+        self.store.save(sm.Config(style="art"))
+        self.store.current()
+        self.path.write_text("{not json", encoding="utf-8")
+        with quiet():
+            self.assertEqual(self.store.current().style, "art")
+
+    def test_non_object_json_keeps_the_last_good_settings(self):
+        self.store.save(sm.Config(style="art"))
+        self.store.current()
+        self.path.write_text("[1, 2, 3]", encoding="utf-8")
+        with quiet():
+            self.assertEqual(self.store.current().style, "art")
+
+    def test_update_merges_over_current_settings(self):
+        self.store.save(sm.Config(style="art", rpm=45.0))
+        updated = self.store.update({"rpm": 30.0})
+        self.assertEqual((updated.style, updated.rpm), ("art", 30.0))
+
+    def test_update_clamps_hostile_input(self):
+        self.assertEqual(self.store.update({"rpm": 10_000}).rpm, 300.0)
+
+    def test_update_persists(self):
+        self.store.update({"idle_scene": "photos"})
+        self.assertEqual(sm.ConfigStore(self.path).current().idle_scene, "photos")
+
+    def test_deleted_file_falls_back_to_defaults(self):
+        self.store.save(sm.Config(style="art"))
+        self.store.current()
+        self.path.unlink()
+        self.assertEqual(self.store.current(), sm.Config())
+
+    def test_save_is_atomic(self):
+        self.store.save(sm.Config())
+        leftovers = [p.name for p in self.path.parent.iterdir() if p.name != self.path.name]
+        self.assertEqual(leftovers, [])
+
+
+class TestAtomicWriteJson(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_writes_readable_json(self):
+        target = self.root / "a.json"
+        sm.atomic_write_json(target, {"b": 1})
+        self.assertEqual(json.loads(target.read_text()), {"b": 1})
+
+    def test_failed_replace_leaves_the_original(self):
+        target = self.root / "a.json"
+        sm.atomic_write_json(target, {"v": "first"})
+        with mock.patch.object(sm.os, "replace", side_effect=OSError("full")):
+            with self.assertRaises(OSError):
+                sm.atomic_write_json(target, {"v": "second"})
+        self.assertEqual(json.loads(target.read_text()), {"v": "first"})
+        self.assertEqual([p.name for p in self.root.iterdir()], ["a.json"])
+
+    def test_private_parent_is_locked_down(self):
+        target = self.root / "secrets" / "t.json"
+        sm.atomic_write_json(target, {"a": 1}, file_mode=0o600, private_parent=True)
+        self.assertEqual(os.stat(target.parent).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+
+    def test_plain_parent_is_not_locked_down(self):
+        os.chmod(self.root, 0o755)
+        sm.atomic_write_json(self.root / "sub" / "c.json", {"a": 1})
+        self.assertEqual(os.stat(self.root).st_mode & 0o777, 0o755)
+
+    def test_bare_filename_does_not_touch_the_working_directory(self):
+        os.chmod(self.root, 0o755)
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        try:
+            sm.atomic_write_json(Path("c.json"), {"a": 1})
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(os.stat(self.root).st_mode & 0o777, 0o755)
+
+
+class TestConfigOverridesFromArgs(unittest.TestCase):
+    def parse(self, argv):
+        return sm.build_parser().parse_args(argv)
+
+    def test_no_flags_means_no_overrides(self):
+        self.assertEqual(sm.config_overrides_from(self.parse([])), {})
+
+    def test_explicit_flags_become_overrides(self):
+        overrides = sm.config_overrides_from(self.parse(["--style", "art", "--rpm", "45"]))
+        self.assertEqual(overrides, {"style": "art", "rpm": 45.0})
+
+    def test_every_configurable_flag_is_covered(self):
+        argv = [
+            "--style", "art", "--idle-scene", "clock", "--rpm", "45",
+            "--photo-seconds", "12", "--clock-24-hour",
+        ]
+        self.assertEqual(
+            set(sm.config_overrides_from(self.parse(argv))), set(sm.CONFIGURABLE_FLAGS)
+        )
+
+    def test_an_explicit_flag_beats_an_existing_config_file(self):
+        """A flag that silently does nothing is worse than no flag."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            sm.ConfigStore(path).save(sm.Config(style="record"))
+            args = self.parse(["--config", str(path), "--style", "art"])
+            store = sm.open_config_store(args)
+            self.assertEqual(store.current().style, "art")
+            self.assertEqual(json.loads(path.read_text())["style"], "art", "and it persists")
+
+    def test_config_file_survives_a_run_with_no_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            sm.ConfigStore(path).save(sm.Config(style="art", rpm=45.0))
+            store = sm.open_config_store(self.parse(["--config", str(path)]))
+            self.assertEqual((store.current().style, store.current().rpm), ("art", 45.0))
+
+    def test_first_run_materialises_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            sm.open_config_store(self.parse(["--config", str(path)]))
+            self.assertTrue(path.exists())
+
+
+# ======================================================================================
+# Clock
+# ======================================================================================
+
+
+class TestClockGlyphs(unittest.TestCase):
+    def test_every_digit_and_the_colon_are_defined(self):
+        for character in "0123456789: ":
+            self.assertIn(character, sm.CLOCK_GLYPHS)
+
+    def test_all_glyphs_have_the_same_height(self):
+        for character, glyph in sm.CLOCK_GLYPHS.items():
+            with self.subTest(character=character):
+                self.assertEqual(len(glyph), sm.CLOCK_GLYPH_HEIGHT)
+
+    def test_each_glyph_is_rectangular(self):
+        for character, glyph in sm.CLOCK_GLYPHS.items():
+            with self.subTest(character=character):
+                self.assertEqual(len({len(row) for row in glyph}), 1)
+
+    def test_glyphs_only_use_the_two_expected_characters(self):
+        for character, glyph in sm.CLOCK_GLYPHS.items():
+            with self.subTest(character=character):
+                self.assertLessEqual(set("".join(glyph)), {"#", "."})
+
+    def test_every_digit_has_some_ink(self):
+        for digit in "0123456789":
+            with self.subTest(digit=digit):
+                self.assertIn("#", "".join(sm.CLOCK_GLYPHS[digit]))
+
+    def test_all_digits_are_distinct(self):
+        rendered = {d: sm.CLOCK_GLYPHS[d] for d in "0123456789"}
+        self.assertEqual(len(set(rendered.values())), 10, "two digits would look identical")
+
+
+class TestClockTextMask(unittest.TestCase):
+    def test_scale_multiplies_both_dimensions(self):
+        one = sm.clock_text_mask("12:34", 1)
+        three = sm.clock_text_mask("12:34", 3)
+        self.assertEqual((three.width, three.height), (one.width * 3, one.height * 3))
+
+    def test_height_is_the_glyph_grid(self):
+        self.assertEqual(sm.clock_text_mask("1", 1).height, sm.CLOCK_GLYPH_HEIGHT)
+
+    def test_mode_is_a_mask(self):
+        self.assertEqual(sm.clock_text_mask("1", 1).mode, "L")
+
+    def test_pixels_are_fully_on_or_off(self):
+        # Any antialiasing here would smear on a 64px panel.
+        values = set(sm.clock_text_mask("18:45", 2).convert("L").getextrema())
+        self.assertLessEqual(values, {0, 255})
+
+    def test_unknown_characters_are_skipped(self):
+        self.assertEqual(
+            sm.clock_text_mask("1?2", 1).width, sm.clock_text_mask("12", 1).width
+        )
+
+    def test_empty_text_does_not_crash(self):
+        self.assertEqual(sm.clock_text_mask("", 2).size, (1, 1))
+
+    def test_wider_text_is_wider(self):
+        self.assertGreater(
+            sm.clock_text_mask("12:34", 1).width, sm.clock_text_mask("1:34", 1).width
+        )
+
+
+class TestClockScaleFor(unittest.TestCase):
+    def test_fits_within_the_panel(self):
+        for size in (32, 64, 128):
+            for text in ("9:41", "12:34", "23:59"):
+                with self.subTest(size=size, text=text):
+                    scale = sm.clock_scale_for(size, text)
+                    mask = sm.clock_text_mask(text, scale)
+                    self.assertLessEqual(mask.width, size)
+                    self.assertLessEqual(mask.height, size)
+
+    def test_never_below_one(self):
+        self.assertGreaterEqual(sm.clock_scale_for(8, "12:34"), 1)
+
+    def test_a_bigger_panel_gets_bigger_digits(self):
+        self.assertGreater(sm.clock_scale_for(128, "12:34"), sm.clock_scale_for(64, "12:34"))
+
+    def test_uses_most_of_a_64px_panel(self):
+        scale = sm.clock_scale_for(64, "12:34")
+        self.assertGreaterEqual(sm.clock_text_mask("12:34", scale).width, 40)
+
+
+class TestFormatClock(unittest.TestCase):
+    def test_24_hour(self):
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 15, 22), True), "15:22")
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 0, 5), True), "00:05")
+
+    def test_12_hour_drops_the_leading_zero(self):
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 15, 22), False), "3:22")
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 9, 41), False), "9:41")
+
+    def test_12_hour_midnight_and_noon_are_twelve(self):
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 0, 5), False), "12:05")
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 12, 0), False), "12:00")
+
+    def test_minutes_are_always_two_digits(self):
+        self.assertEqual(sm.format_clock(datetime(2026, 8, 7, 7, 3), False), "7:03")
+
+
+class TestDrawClockText(unittest.TestCase):
+    def frame(self, colour=(0, 0, 0), size=64):
+        return Image.new("RGB", (size, size), colour)
+
+    def test_draws_white_pixels(self):
+        frame = self.frame()
+        sm.draw_clock_text(frame, "12:34", 2, outline=None)
+        self.assertEqual(frame.getextrema()[0][1], 255)
+
+    def test_is_horizontally_centred(self):
+        # Centred on the glyph cells, not on the ink: digits occupy fixed-width cells so
+        # the time does not shuffle sideways as the digits change.
+        mask = sm.clock_text_mask("12:34", 2)
+        left = (64 - mask.width) // 2
+        self.assertLessEqual(abs(left - (64 - left - mask.width)), 1)
+
+    def test_layout_does_not_jitter_between_times(self):
+        widths = {sm.clock_text_mask(text, 2).width for text in ("11:11", "23:59", "10:08")}
+        self.assertEqual(len(widths), 1, "same digit count must occupy the same width")
+
+    def test_outline_makes_white_text_readable_on_a_pale_photo(self):
+        frame = self.frame((255, 255, 255))
+        sm.draw_clock_text(frame, "12:34", 2)
+        self.assertEqual(frame.getextrema()[0][0], 0, "a black halo must be drawn")
+
+    def test_without_an_outline_white_on_white_is_invisible(self):
+        frame = self.frame((255, 255, 255))
+        sm.draw_clock_text(frame, "12:34", 2, outline=None)
+        self.assertEqual(frame.getextrema()[0][0], 255, "which is why the halo exists")
+
+    def test_centre_y_moves_the_text(self):
+        high, low = self.frame(), self.frame()
+        sm.draw_clock_text(high, "12:34", 2, outline=None, centre_y=16)
+        sm.draw_clock_text(low, "12:34", 2, outline=None, centre_y=48)
+        def rows(frame):
+            return [y for y in range(64)
+                    if any(frame.getpixel((x, y)) != (0, 0, 0) for x in range(64))]
+        self.assertLess(max(rows(high)), min(rows(low)))
+
+    def test_stays_inside_the_frame(self):
+        frame = self.frame()
+        sm.draw_clock_text(frame, "23:59", sm.clock_scale_for(64, "23:59"))
+        self.assertEqual(frame.size, (64, 64))
+
+
+# ======================================================================================
+# Photos
+# ======================================================================================
+
+
+class PhotoFixture(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "photos"
+        self.dir.mkdir()
+        self.clock = FakeClock()
+
+    def add(self, name, colour=(200, 30, 30), size=(200, 120)):
+        Image.new("RGB", size, colour).save(self.dir / name)
+        return self.dir / name
+
+    def library(self, seconds=30.0, size=64):
+        return sm.PhotoLibrary(self.dir, size, seconds=lambda: seconds, clock=self.clock)
+
+
+class TestPhotoLibrary(PhotoFixture):
+    def test_empty_directory_has_no_photo(self):
+        library = self.library()
+        self.assertFalse(library.advance())
+        self.assertIsNone(library.current())
+
+    def test_missing_directory_does_not_crash(self):
+        library = sm.PhotoLibrary(
+            self.dir / "nope", 64, seconds=lambda: 30.0, clock=self.clock
+        )
+        self.assertFalse(library.advance())
+        self.assertEqual(library.available(), [])
+
+    def test_fits_photos_to_the_panel(self):
+        self.add("a.png")
+        library = self.library()
+        library.advance()
+        self.assertEqual(library.current().size, (64, 64))
+        self.assertEqual(library.current().mode, "RGB")
+
+    def test_lists_only_image_files(self):
+        self.add("a.png")
+        self.add("b.jpg")
+        (self.dir / "notes.txt").write_text("not an image")
+        (self.dir / "sub").mkdir()
+        self.assertEqual(self.library().scan().__len__(), 2)
+
+    def test_advances_in_sorted_order_and_wraps(self):
+        for name in ("3.png", "1.png", "2.png"):
+            self.add(name)
+        library = self.library()
+        seen = []
+        for _ in range(4):
+            library.advance()
+            seen.append(library.current_name())
+        self.assertEqual(seen, ["1.png", "2.png", "3.png", "1.png"])
+
+    def test_unreadable_files_are_skipped_not_fatal(self):
+        (self.dir / "broken.png").write_bytes(b"definitely not a png")
+        self.add("good.png")
+        library = self.library()
+        with quiet():
+            self.assertTrue(library.advance())
+        self.assertEqual(library.current_name(), "good.png")
+
+    def test_all_files_broken_reports_no_photo(self):
+        (self.dir / "broken.png").write_bytes(b"nope")
+        library = self.library()
+        with quiet():
+            self.assertFalse(library.advance())
+
+    def test_tick_holds_a_photo_for_its_full_time(self):
+        self.add("1.png")
+        self.add("2.png")
+        library = self.library(seconds=30.0)
+        library.tick()
+        self.assertEqual(library.current_name(), "1.png")
+        self.clock.advance(29)
+        library.tick()
+        self.assertEqual(library.current_name(), "1.png")
+        self.clock.advance(2)
+        library.tick()
+        self.assertEqual(library.current_name(), "2.png")
+
+    def test_new_photos_are_picked_up_without_a_restart(self):
+        self.add("1.png")
+        library = self.library()
+        self.assertEqual(len(library.scan()), 1)
+        self.add("2.png")
+        os.utime(self.dir, (self.clock.now + 100, self.clock.now + 100))
+        self.assertEqual(len(library.scan()), 2)
+
+    def test_first_photo_event_lets_a_preview_wait(self):
+        self.add("1.png")
+        library = self.library()
+        self.assertFalse(library.wait_for_first_photo(0.01))
+        library.advance()
+        self.assertTrue(library.wait_for_first_photo(0.01))
+
+    def test_available_lists_names(self):
+        self.add("b.png")
+        self.add("a.png")
+        library = self.library()
+        library.scan()
+        self.assertEqual(library.available(), ["a.png", "b.png"])
+
+    def test_run_loop_stops_on_the_event(self):
+        self.add("1.png")
+        library = self.library()
+        stop = threading.Event()
+        stop.set()
+        library.run(stop, interval=0.01)  # returns immediately
+        self.assertIsNone(library.current())
+
+
+# ======================================================================================
+# Scenes
+# ======================================================================================
+
+
+class TestBlankScene(unittest.TestCase):
+    def test_is_the_idle_frame(self):
+        scene = sm.BlankScene(64)
+        self.assertEqual(scene.frame(0.0).tobytes(), sm.render_idle(64).tobytes())
+
+    def test_frame_is_reused(self):
+        scene = sm.BlankScene(64)
+        self.assertIs(scene.frame(0.0), scene.frame(1.0))
+
+
+class TestClockScene(unittest.TestCase):
+    def scene(self, moment=datetime(2026, 8, 7, 15, 22), use_24_hour=True, size=64):
+        return sm.ClockScene(size, use_24_hour=lambda: use_24_hour, now=lambda: moment)
+
+    def test_renders_the_time(self):
+        frame = self.scene().frame(0.0)
+        self.assertEqual(frame.size, (64, 64))
+        self.assertEqual(frame.getextrema()[0][1], 255, "digits should be lit")
+
+    def test_text_follows_the_clock_format(self):
+        self.assertEqual(self.scene(use_24_hour=True).text(), "15:22")
+        self.assertEqual(self.scene(use_24_hour=False).text(), "3:22")
+
+    def test_frame_is_cached_within_the_minute(self):
+        scene = self.scene()
+        self.assertIs(scene.frame(0.0), scene.frame(19.0), "no need to redraw 20x a second")
+
+    def test_frame_is_redrawn_when_the_minute_changes(self):
+        moments = iter([datetime(2026, 8, 7, 15, 22), datetime(2026, 8, 7, 15, 23)])
+        scene = sm.ClockScene(64, use_24_hour=lambda: True, now=lambda: next(moments))
+        first = scene.frame(0.0).tobytes()
+        self.assertNotEqual(first, scene.frame(1.0).tobytes())
+
+    def test_format_change_takes_effect(self):
+        fmt = {"24": True}
+        scene = sm.ClockScene(
+            64, use_24_hour=lambda: fmt["24"], now=lambda: datetime(2026, 8, 7, 15, 22)
+        )
+        first = scene.frame(0.0).tobytes()
+        fmt["24"] = False
+        self.assertNotEqual(first, scene.frame(1.0).tobytes())
+
+
+class TestPhotoScene(PhotoFixture):
+    def test_shows_the_current_photo(self):
+        self.add("a.png", colour=(10, 200, 40))
+        library = self.library()
+        library.advance()
+        frame = sm.PhotoScene(library, 64).frame(0.0)
+        self.assertEqual(frame.getpixel((32, 32)), (10, 200, 40))
+
+    def test_falls_back_to_the_idle_frame_with_no_photos(self):
+        scene = sm.PhotoScene(self.library(), 64)
+        self.assertEqual(scene.frame(0.0).tobytes(), sm.render_idle(64).tobytes())
+
+    def test_falls_back_to_the_clock_when_one_is_configured(self):
+        clock = sm.ClockScene(64, lambda: True, now=lambda: datetime(2026, 8, 7, 15, 22))
+        scene = sm.PhotoScene(self.library(), 64, clock=clock)
+        self.assertEqual(scene.frame(0.0).tobytes(), clock.frame(0.0).tobytes())
+
+    def test_clock_is_drawn_over_the_photo(self):
+        self.add("a.png", colour=(255, 255, 255))
+        library = self.library()
+        library.advance()
+        clock = sm.ClockScene(64, lambda: True, now=lambda: datetime(2026, 8, 7, 15, 22))
+        frame = sm.PhotoScene(library, 64, clock=clock).frame(0.0)
+        self.assertEqual(frame.getextrema()[0][0], 0, "outlined text over a white photo")
+
+    def test_does_not_mutate_the_library_photo(self):
+        self.add("a.png", colour=(255, 255, 255))
+        library = self.library()
+        library.advance()
+        clock = sm.ClockScene(64, lambda: True, now=lambda: datetime(2026, 8, 7, 15, 22))
+        sm.PhotoScene(library, 64, clock=clock).frame(0.0)
+        self.assertEqual(library.current().getextrema()[0][0], 255, "photo must stay pristine")
+
+
+class TestSceneDirector(PhotoFixture):
+    def build(self, **config):
+        store = stub_config(**config)
+        state = sm.PlaybackState()
+        library = self.library()
+        renderers = {name: sm.build_renderer(name, 64) for name in sm.RENDERER_STYLES}
+        album = sm.AlbumScene(renderers, state, store)
+        scenes = sm.build_scenes(
+            64, store, library, now=lambda: datetime(2026, 8, 7, 15, 22)
+        )
+        return sm.SceneDirector(store, album, scenes, state), state, store
+
+    def test_playback_selects_the_album_scene(self):
+        director, state, _ = self.build()
+        state.update(sm.PlaybackArt("k", "u", True), art_image(size=(60, 60)))
+        self.assertEqual(director.scene_name(director.config_store.current()), "album")
+
+    def test_no_playback_selects_the_idle_scene(self):
+        director, _, store = self.build(idle_scene="clock")
+        self.assertEqual(director.scene_name(store.current()), "clock")
+
+    def test_override_wins_over_playback(self):
+        director, state, store = self.build(override_scene="clock")
+        state.update(sm.PlaybackArt("k", "u", True), art_image(size=(60, 60)))
+        self.assertEqual(director.scene_name(store.current()), "clock")
+
+    def test_every_scene_name_renders_a_frame(self):
+        for scene in sm.SCENE_NAMES:
+            with self.subTest(scene=scene):
+                director, _, _ = self.build(override_scene=scene)
+                frame = director(1.0)
+                self.assertEqual(frame.size, (64, 64))
+                self.assertEqual(frame.mode, "RGB")
+
+    def test_idle_scene_clock_actually_shows_the_clock(self):
+        director, _, _ = self.build(idle_scene="clock")
+        self.assertEqual(director(1.0).getextrema()[0][1], 255)
+
+    def test_unknown_scene_falls_back_to_album(self):
+        director, _, _ = self.build()
+        director.config_store = stub_config()
+        director.scenes.pop("blank", None)
+        self.assertEqual(director(1.0).size, (64, 64))
+
+    def test_build_scenes_covers_every_non_album_scene(self):
+        _, _, store = self.build()
+        scenes = sm.build_scenes(64, store, self.library())
+        self.assertEqual(set(scenes), {name for name in sm.SCENE_NAMES if name != "album"})
+
+
+class TestConfiguredDisplay(unittest.TestCase):
+    class Recording:
+        def __init__(self):
+            self.frames = []
+            self.brightness = []
+            self.entered = self.exited = 0
+
+        def show(self, image):
+            self.frames.append(image)
+
+        def clear(self):
+            pass
+
+        def set_brightness(self, value):
+            self.brightness.append(value)
+
+        def __enter__(self):
+            self.entered += 1
+            return self
+
+        def __exit__(self, *exc):
+            self.exited += 1
+
+    def test_passes_frames_through(self):
+        inner = self.Recording()
+        display = sm.ConfiguredDisplay(inner, stub_config())
+        display.show(art_image())
+        self.assertEqual(len(inner.frames), 1)
+
+    def test_applies_brightness_once(self):
+        inner = self.Recording()
+        display = sm.ConfiguredDisplay(inner, stub_config(brightness=40))
+        display.show(art_image())
+        display.show(art_image())
+        self.assertEqual(inner.brightness, [40], "only on change, not every frame")
+
+    def test_no_brightness_configured_leaves_the_panel_alone(self):
+        inner = self.Recording()
+        sm.ConfiguredDisplay(inner, stub_config(brightness=None)).show(art_image())
+        self.assertEqual(inner.brightness, [])
+
+    def test_backend_without_brightness_support_is_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inner = sm.MockDisplay(Path(tmp) / "f.png")
+            sm.ConfiguredDisplay(inner, stub_config(brightness=40)).show(art_image(size=(8, 8)))
+
+    def test_forwards_the_context_manager(self):
+        inner = self.Recording()
+        with sm.ConfiguredDisplay(inner, stub_config()):
+            pass
+        self.assertEqual((inner.entered, inner.exited), (1, 1))
+
+
+# ======================================================================================
+# Web control UI
+# ======================================================================================
+
+
+class TestControlServer(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = sm.ConfigStore(Path(self.tmp.name) / "config.json")
+        self.store.save(sm.Config())
+        self.status = {"provider": "lastfm", "scene": "album", "scenes": list(sm.SCENE_NAMES),
+                       "styles": list(sm.RENDERER_STYLES)}
+        with quiet():
+            self.server = sm.ControlServer(
+                self.store, status=lambda: self.status, host="127.0.0.1", port=0
+            )
+            self.server.start()
+        self.addCleanup(self.server.stop)
+        self.base = f"http://127.0.0.1:{self.server.server.server_address[1]}"
+
+    def get(self, route):
+        return sm.http_request("GET", self.base + route, timeout=5)
+
+    def post(self, route, payload, raw=None):
+        body = raw if raw is not None else json.dumps(payload).encode()
+        request = sm.urllib.request.Request(
+            self.base + route, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with sm.urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except sm.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    def test_serves_a_self_contained_page(self):
+        response = self.get("/")
+        self.assertEqual(response.status, 200)
+        page = response.body.decode()
+        self.assertIn("<title>Tune Matrix</title>", page)
+        # A strict no-external-assets rule: the Pi may have no internet at all.
+        for marker in ("http://", "https://", "cdn"):
+            self.assertNotIn(marker, page.replace("http-equiv", ""))
+
+    def test_config_endpoint_returns_current_settings(self):
+        response = self.get("/api/config")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json(), sm.Config().as_dict())
+
+    def test_status_endpoint_reports_what_is_on_screen(self):
+        self.assertEqual(self.get("/api/status").json()["scene"], "album")
+
+    def test_post_updates_and_persists_config(self):
+        status, body = self.post("/api/config", {"idle_scene": "clock"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["idle_scene"], "clock")
+        self.assertEqual(self.store.current().idle_scene, "clock")
+
+    def test_post_merges_rather_than_replacing(self):
+        self.post("/api/config", {"style": "art"})
+        self.post("/api/config", {"rpm": 45})
+        self.assertEqual(self.store.current().style, "art")
+
+    def test_post_clamps_hostile_values(self):
+        _, body = self.post("/api/config", {"rpm": 99999, "brightness": -12})
+        self.assertEqual(body["rpm"], 300.0)
+        self.assertEqual(body["brightness"], 1)
+
+    def test_post_ignores_unknown_keys(self):
+        status, body = self.post("/api/config", {"exec": "rm -rf /", "style": "art"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("exec", body)
+
+    def test_post_rejects_invalid_json(self):
+        status, body = self.post("/api/config", None, raw=b"{not json")
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
+    def test_post_rejects_a_non_object_body(self):
+        self.assertEqual(self.post("/api/config", [1, 2, 3])[0], 400)
+
+    def test_post_rejects_an_oversized_body(self):
+        self.assertEqual(self.post("/api/config", {"style": "x" * 20000})[0], 400)
+
+    def test_unknown_routes_are_404_not_files(self):
+        """There is no filesystem serving at all, so no path can reach .env."""
+        for route in ("/.env", "/config.json", "/../.env", "/tune_matrix.py", "/nope"):
+            with self.subTest(route=route):
+                self.assertEqual(self.get(route).status, 404)
+
+    def test_post_to_an_unknown_route_is_404(self):
+        self.assertEqual(self.post("/api/anything", {"style": "art"})[0], 404)
+
+    def test_url_is_reported(self):
+        self.assertIn("127.0.0.1", self.server.url)
+
+    def test_stop_releases_the_port(self):
+        port = self.server.server.server_address[1]
+        self.server.stop()
+        rebound = sm.ThreadingHTTPServer(("127.0.0.1", port), sm.BaseHTTPRequestHandler)
+        rebound.server_close()
+        self.server.stop = lambda: None  # already stopped; keep addCleanup happy
+
+
+class TestControlStatus(PhotoFixture):
+    def test_reports_scene_playback_and_photos(self):
+        self.add("a.png")
+        library = self.library()
+        library.advance()
+        store = stub_config(idle_scene="photos")
+        state = sm.PlaybackState()
+        renderers = {n: sm.build_renderer(n, 64) for n in sm.RENDERER_STYLES}
+        director = sm.SceneDirector(
+            store, sm.AlbumScene(renderers, state, store),
+            sm.build_scenes(64, store, library), state,
+        )
+        status = sm.control_status("lastfm", state, director, library)
+        self.assertEqual(status["provider"], "lastfm")
+        self.assertEqual(status["scene"], "photos")
+        self.assertEqual(status["playback"], "idle")
+        self.assertEqual(status["photo"], "a.png")
+        self.assertEqual(status["photo_count"], 1)
+        self.assertEqual(status["scenes"], list(sm.SCENE_NAMES))
+
+    def test_reports_the_track_when_playing(self):
+        store = stub_config()
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("k", "u", True, title="Robyn - Honey"), art_image((1, 1, 1), (60, 60)))
+        renderers = {n: sm.build_renderer(n, 64) for n in sm.RENDERER_STYLES}
+        director = sm.SceneDirector(
+            store, sm.AlbumScene(renderers, state, store),
+            sm.build_scenes(64, store, self.library()), state,
+        )
+        status = sm.control_status("lastfm", state, director, self.library())
+        self.assertEqual((status["scene"], status["playback"], status["track"]),
+                         ("album", "playing", "Robyn - Honey"))
+
+
+class TestSceneEndToEnd(unittest.TestCase):
+    """Scenes selected from config.json, rendered through the real run() path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.config = self.dir / "config.json"
+        self.photos = self.dir / "photos"
+        self.photos.mkdir()
+        self.output = self.dir / "frame.png"
+
+    def write_config(self, **values):
+        self.config.write_text(json.dumps(values), encoding="utf-8")
+
+    def run_cli(self, *extra):
+        argv = [
+            "--provider", "demo", "--config", str(self.config), "--photos", str(self.photos),
+            "--mock-output", str(self.output), "--once", *extra,
+        ]
+        with quiet():
+            sm.run(sm.build_parser().parse_args(argv))
+        with Image.open(self.output) as frame:
+            return frame.convert("RGB").copy()
+
+    def add_photo(self, name, colour):
+        Image.new("RGB", (300, 200), colour).save(self.photos / name)
+
+    def test_clock_override_shows_the_clock_not_album_art(self):
+        self.write_config(override_scene="clock")
+        frame = self.run_cli()
+        self.assertEqual(frame.getextrema()[0][1], 255, "lit digits")
+        self.assertEqual(frame.getpixel((0, 0)), (0, 0, 0), "clock sits on black")
+
+    def test_photos_override_shows_a_photo(self):
+        self.add_photo("a.png", (12, 190, 60))
+        self.write_config(override_scene="photos")
+        self.assertEqual(self.run_cli().getpixel((32, 32)), (12, 190, 60))
+
+    def test_photos_plus_clock_shows_both(self):
+        self.add_photo("a.png", (255, 255, 255))
+        self.write_config(override_scene="photos+clock")
+        frame = self.run_cli()
+        self.assertEqual(frame.getpixel((2, 2)), (255, 255, 255), "photo fills the panel")
+        self.assertEqual(frame.getextrema()[0][0], 0, "with outlined digits over it")
+
+    def test_idle_scene_applies_only_when_nothing_plays(self):
+        self.write_config(idle_scene="clock")
+        # The demo provider starts out playing, so album art wins.
+        self.assertEqual(self.run_cli().getpixel((0, 0)), (0, 0, 0))
+
+    def test_config_written_by_the_web_ui_takes_effect_next_frame(self):
+        """The UI only ever writes config.json, so this is the whole integration."""
+        self.add_photo("a.png", (12, 190, 60))
+        store = sm.ConfigStore(self.config)
+        store.update({"override_scene": "photos"})
+        self.assertEqual(self.run_cli().getpixel((32, 32)), (12, 190, 60))
+
+    def test_no_web_server_for_a_bounded_render(self):
+        self.write_config()
+        with mock.patch.object(sm, "ControlServer", side_effect=AssertionError("no server")):
+            self.run_cli()
+
+    def test_web_port_zero_disables_the_server(self):
+        args = sm.build_parser().parse_args(["--web-port", "0"])
+        self.assertEqual(args.web_port, 0)
 
 
 if __name__ == "__main__":
