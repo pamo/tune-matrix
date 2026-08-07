@@ -2886,12 +2886,40 @@ class TestConfigOverridesFromArgs(unittest.TestCase):
 
     def test_every_configurable_flag_is_covered(self):
         argv = [
-            "--style", "art", "--idle-scene", "clock", "--rpm", "45",
+            "--style", "art", "--scene", "clock", "--idle-scene", "clock", "--rpm", "45",
             "--photo-seconds", "12", "--clock-24-hour",
         ]
         self.assertEqual(
-            set(sm.config_overrides_from(self.parse(argv))), set(sm.CONFIGURABLE_FLAGS)
+            set(sm.config_overrides_from(self.parse(argv))),
+            set(sm.CONFIGURABLE_FLAGS.values()),
         )
+
+    def test_every_flag_maps_to_a_real_config_field(self):
+        self.assertLessEqual(set(sm.CONFIGURABLE_FLAGS.values()), set(sm.Config().as_dict()))
+
+    def test_scene_flag_sets_the_override(self):
+        self.assertEqual(
+            sm.config_overrides_from(self.parse(["--scene", "photos"])),
+            {"override_scene": "photos"},
+        )
+
+    def test_scene_auto_clears_the_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            sm.ConfigStore(path).save(sm.Config(override_scene="photos"))
+            store = sm.open_config_store(self.parse(["--config", str(path), "--scene", "auto"]))
+            self.assertIsNone(store.current().override_scene)
+
+    def test_scene_accepts_every_scene_plus_auto(self):
+        action = next(a for a in sm.build_parser()._actions if a.dest == "scene")
+        self.assertEqual(set(action.choices), {"auto", *sm.SCENE_NAMES})
+
+    def test_scene_flag_beats_an_existing_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            sm.ConfigStore(path).save(sm.Config(override_scene="clock"))
+            store = sm.open_config_store(self.parse(["--config", str(path), "--scene", "photos"]))
+            self.assertEqual(store.current().override_scene, "photos")
 
     def test_an_explicit_flag_beats_an_existing_config_file(self):
         """A flag that silently does nothing is worse than no flag."""
@@ -3544,6 +3572,26 @@ class TestSceneEndToEnd(unittest.TestCase):
         self.add_photo("a.png", (12, 190, 60))
         self.write_config(override_scene="photos")
         self.assertEqual(self.run_cli().getpixel((32, 32)), (12, 190, 60))
+
+    def test_scene_flag_shows_photos_immediately_even_while_playing(self):
+        """--scene is the "let me just look at it" path; the demo provider starts playing."""
+        self.add_photo("a.png", (12, 190, 60))
+        self.write_config()
+        self.assertEqual(self.run_cli("--scene", "photos").getpixel((32, 32)), (12, 190, 60))
+
+    def test_photo_scene_with_an_empty_directory_does_not_crash(self):
+        self.write_config()
+        frame = self.run_cli("--scene", "photos")
+        self.assertEqual(frame.tobytes(), sm.render_idle(64).tobytes())
+
+    def test_heic_style_double_suffix_is_still_read(self):
+        # Phone exports land as IMG_1234.HEIC.jpeg; only the final suffix should matter.
+        Image.new("RGB", (300, 200), (200, 40, 90)).save(self.photos / "IMG_1.HEIC.jpeg")
+        self.write_config()
+        pixel = self.run_cli("--scene", "photos").getpixel((32, 32))
+        # JPEG is lossy, so compare loosely: this is about the filename, not fidelity.
+        for channel, expected in zip(pixel, (200, 40, 90)):
+            self.assertAlmostEqual(channel, expected, delta=6)
 
     def test_photos_plus_clock_shows_both(self):
         self.add_photo("a.png", (255, 255, 255))

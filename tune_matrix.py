@@ -2207,7 +2207,16 @@ def build_provider(args: argparse.Namespace) -> PlaybackProvider:
     return spec.factory(args, {name: value or "" for name, value in env.items()})
 
 
-CONFIGURABLE_FLAGS = ("style", "idle_scene", "rpm", "clock_24_hour", "photo_seconds")
+# Command-line flag -> config key. They differ where the flag reads better: --scene says
+# "show this now", which is the override rather than the idle fallback.
+CONFIGURABLE_FLAGS = {
+    "style": "style",
+    "scene": "override_scene",
+    "idle_scene": "idle_scene",
+    "rpm": "rpm",
+    "clock_24_hour": "clock_24_hour",
+    "photo_seconds": "photo_seconds",
+}
 
 
 def config_overrides_from(args: argparse.Namespace) -> dict[str, Any]:
@@ -2218,9 +2227,9 @@ def config_overrides_from(args: argparse.Namespace) -> dict[str, Any]:
     disagrees with what is on the panel. Flags left off default to None and are ignored.
     """
     return {
-        name: getattr(args, name)
-        for name in CONFIGURABLE_FLAGS
-        if getattr(args, name, None) is not None
+        key: getattr(args, flag)
+        for flag, key in CONFIGURABLE_FLAGS.items()
+        if getattr(args, flag, None) is not None
     }
 
 
@@ -2823,6 +2832,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("config.json"),
         help="Settings file, re-read whenever it changes. Written on first run.",
+    )
+    parser.add_argument(
+        "--scene",
+        choices=("auto", *SCENE_NAMES),
+        default=None,
+        help=(
+            "Show this scene now, whatever is playing. 'auto' follows playback and falls "
+            "back to --idle-scene. Use this to look at a scene straight away."
+        ),
     )
     parser.add_argument(
         "--idle-scene",

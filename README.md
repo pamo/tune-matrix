@@ -217,9 +217,13 @@ Be warned that 64x64 is **brutally** lo-fi. A tight crop of a face reads; a land
 becomes abstract colour fields. Check yours before committing to the panel:
 
 ```bash
-python tune_matrix.py --photos ~/Pictures/test --preview-terminal
-python tune_matrix.py --photos ~/Pictures/test --mock-output /tmp/p.png --preview-scale 10 --preview-grid --once
+python tune_matrix.py --scene photos --photos ~/Pictures/test --preview-terminal
+python tune_matrix.py --scene photos --photos ~/Pictures/test \\
+  --mock-output /tmp/p.png --preview-scale 10 --preview-grid --once
 ```
+
+`--scene photos` matters here: without it the panel follows playback, so you would be
+looking at album art rather than your photos.
 
 ## Changing settings while it runs
 
@@ -262,6 +266,15 @@ web UI never shows something different from what is on the panel:
 
 ```bash
 tune_matrix.py --style art --idle-scene photos+clock --clock-24-hour
+```
+
+`--scene` shows one scene right now, whatever is playing — the quickest way to look at
+something. `--scene auto` goes back to following your music:
+
+```bash
+tune_matrix.py --scene photos          # show photos immediately
+tune_matrix.py --scene photos+clock    # photos with the time over them
+tune_matrix.py --scene auto            # back to following playback
 ```
 
 Or edit the file directly; the display picks it up within a frame:
