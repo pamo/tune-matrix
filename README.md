@@ -1,4 +1,4 @@
-# Now Playing Matrix
+# Tune Matrix
 
 Shows current album art on a 64x64 RGB matrix, either as a spinning record or as static
 full-bleed art (see [Display style](#display-style)). In the default record style the album
@@ -23,8 +23,8 @@ Supported providers:
 
 ## Files
 
-- `spotify_matrix.py` - Pi runtime script.
-- `test_spotify_matrix.py` - unit tests (stdlib `unittest`, no extra packages).
+- `tune_matrix.py` - Pi runtime script.
+- `test_tune_matrix.py` - unit tests (stdlib `unittest`, no extra packages).
 - `.env` - local provider credentials, ignored by Git.
 - `.env.example` - template for recreating local config.
 - `requirements.txt` - Python dependencies, excluding the hardware-specific RGB matrix bindings.
@@ -87,7 +87,7 @@ no paid account and polls cleanly from a headless Pi.
 4. Verify, and **read the account it names back**:
 
    ```bash
-   python spotify_matrix.py --provider lastfm --auth-only
+   python tune_matrix.py --provider lastfm --auth-only
    ```
 
    ```
@@ -121,7 +121,7 @@ Then create auth headers with `ytmusicapi` and save the JSON file (default path
 This is the working command to run the script on your raspberry pi:
 
 ```bash
-sudo -E .venv/bin/python spotify_matrix.py \
+sudo -E .venv/bin/python tune_matrix.py \
   --rows 64 \
   --cols 64 \
   --chain-length 1 \
@@ -139,16 +139,16 @@ a fraction of the panel.
 The provider defaults to `lastfm`, so no flag is needed for it. Pick another explicitly:
 
 ```bash
-sudo -E .venv/bin/python spotify_matrix.py                          # lastfm
-sudo -E .venv/bin/python spotify_matrix.py --provider spotify
-sudo -E .venv/bin/python spotify_matrix.py --provider youtube-music
-sudo -E .venv/bin/python spotify_matrix.py --provider demo          # no credentials
+sudo -E .venv/bin/python tune_matrix.py                          # lastfm
+sudo -E .venv/bin/python tune_matrix.py --provider spotify
+sudo -E .venv/bin/python tune_matrix.py --provider youtube-music
+sudo -E .venv/bin/python tune_matrix.py --provider demo          # no credentials
 ```
 
 Useful hardware options:
 
 ```bash
-sudo -E .venv/bin/python spotify_matrix.py \
+sudo -E .venv/bin/python tune_matrix.py \
   --hardware-mapping regular \
   --gpio-slowdown 2 \
   --brightness 65
@@ -158,7 +158,7 @@ To bring up new panel wiring, show a moving colour test pattern. This needs no p
 credentials and makes no network calls, so it is the first thing to run on a fresh Pi:
 
 ```bash
-sudo -E .venv/bin/python spotify_matrix.py --test-pattern
+sudo -E .venv/bin/python tune_matrix.py --test-pattern
 ```
 
 ## Display style
@@ -171,7 +171,7 @@ sudo -E .venv/bin/python spotify_matrix.py --test-pattern
 | `art` | Album art static and full-bleed, edge to edge. No disc, no rotation. |
 
 ```bash
-sudo -E .venv/bin/python spotify_matrix.py --style art
+sudo -E .venv/bin/python tune_matrix.py --style art
 ```
 
 `--style art` does no per-frame work at all, so `--fps 2` is plenty and saves CPU on a
@@ -189,7 +189,7 @@ half-blocks, which also makes each pixel come out roughly square, so a 64x64 fra
 columns by 32 rows. No dependencies, and it works over SSH.
 
 ```bash
-python spotify_matrix.py --preview-terminal
+python tune_matrix.py --preview-terminal
 ```
 
 It magnifies to fill the window, draws a status line underneath, and renders into the
@@ -232,15 +232,15 @@ playing → paused → nothing playing, so every state the panel can be in shows
 run. Nothing is downloaded:
 
 ```bash
-python spotify_matrix.py --provider demo --preview-terminal
-python spotify_matrix.py --provider demo --style art --demo-cycle-seconds 3
+python tune_matrix.py --provider demo --preview-terminal
+python tune_matrix.py --provider demo --style art --demo-cycle-seconds 3
 ```
 
 **Record an animation.** Writes a looping GIF, which is the easiest way to judge whether
 the spin speed looks right:
 
 ```bash
-python spotify_matrix.py --provider demo --record-gif /tmp/spin.gif --record-seconds 6
+python tune_matrix.py --provider demo --record-gif /tmp/spin.gif --record-seconds 6
 ```
 
 **A single frame, magnified.** `--preview-scale` magnifies with nearest-neighbour so the
@@ -248,14 +248,14 @@ pixels stay crisp, and `--preview-grid` draws the inter-pixel gutter, which appr
 how the panel reads behind a diffusion layer:
 
 ```bash
-python spotify_matrix.py --mock-output /tmp/frame.png --preview-scale 8 --preview-grid --once
+python tune_matrix.py --mock-output /tmp/frame.png --preview-scale 8 --preview-grid --once
 ```
 
 **Static sample frames**, no provider and no network:
 
 ```bash
-python spotify_matrix.py --preview-frames /tmp/preview --preview-scale 6
-python spotify_matrix.py --preview-frames /tmp/preview --style art
+python tune_matrix.py --preview-frames /tmp/preview --preview-scale 6
+python tune_matrix.py --preview-frames /tmp/preview --style art
 ```
 
 `--mock-output`, `--preview-terminal` and `--record-gif` are mutually exclusive; without
@@ -292,28 +292,28 @@ job is to tell you whether credentials work right now.
 Run this once to complete OAuth and cache a refresh token:
 
 ```bash
-python spotify_matrix.py --provider spotify --auth-only --auth-timeout-seconds 180
+python tune_matrix.py --provider spotify --auth-only --auth-timeout-seconds 180
 ```
 
 Then run a one-frame live smoke test and write the rendered frame to disk:
 
 ```bash
-python spotify_matrix.py --provider spotify --mock-output /tmp/spotify-matrix-smoke.png --once
+python tune_matrix.py --provider spotify --mock-output /tmp/tune-matrix-smoke.png --once
 ```
 
 For Last.fm, verify the API key/user and render one frame (start a track first so something
 is scrobbling, otherwise the frame renders idle):
 
 ```bash
-python spotify_matrix.py --provider lastfm --auth-only
-python spotify_matrix.py --provider lastfm --mock-output /tmp/lastfm-smoke.png --once
+python tune_matrix.py --provider lastfm --auth-only
+python tune_matrix.py --provider lastfm --mock-output /tmp/lastfm-smoke.png --once
 ```
 
 For YouTube Music, verify the auth headers and render one frame:
 
 ```bash
-python spotify_matrix.py --provider youtube-music --auth-only
-python spotify_matrix.py --provider youtube-music --mock-output /tmp/youtube-music-smoke.png --once
+python tune_matrix.py --provider youtube-music --auth-only
+python tune_matrix.py --provider youtube-music --mock-output /tmp/youtube-music-smoke.png --once
 ```
 
 ## Music provider support

@@ -1,4 +1,4 @@
-"""Unit tests for spotify_matrix.
+"""Unit tests for tune_matrix.
 
 Stdlib unittest only, so the Pi does not need extra packages to run these:
 
@@ -27,8 +27,8 @@ from unittest import mock
 
 from PIL import Image, ImageSequence
 
-sys.argv = ["spotify_matrix"]
-import spotify_matrix as sm
+sys.argv = ["tune_matrix"]
+import tune_matrix as sm
 
 PLACEHOLDER_URL = (
     "https://lastfm.freetls.fastly.net/i/u/300x300/"
