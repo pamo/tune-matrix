@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import os
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -720,8 +721,9 @@ class MatrixDisplay:
             from rgbmatrix import RGBMatrix, RGBMatrixOptions
         except ImportError as exc:
             raise RuntimeError(
-                "The rgbmatrix Python bindings are not installed. "
-                "Install hzeller/rpi-rgb-led-matrix on the Pi, or run with --mock-output."
+                "The rgbmatrix Python bindings are not installed. Install "
+                "hzeller/rpi-rgb-led-matrix on the Pi, or preview without hardware using "
+                "--preview-terminal (live), --record-gif or --mock-output."
             ) from exc
 
         options = RGBMatrixOptions()
@@ -799,19 +801,81 @@ class MockDisplay:
         self.clear()
 
 
+def terminal_scale_for(
+    frame_size: tuple[int, int],
+    terminal_size: tuple[int, int],
+    reserved_rows: int = 2,
+) -> int:
+    """Largest whole-pixel magnification of `frame_size` that fits the terminal.
+
+    A magnified pixel is `scale` columns wide but only `scale / 2` character rows tall,
+    because each row of cells carries two pixel rows.
+    """
+    frame_width, frame_height = frame_size
+    columns, rows = terminal_size
+    usable_rows = max(rows - reserved_rows, 1)
+
+    by_width = columns // frame_width
+    by_height = (usable_rows * 2) // frame_height
+    return max(1, min(by_width, by_height))
+
+
 class TerminalDisplay:
     """Live preview in the terminal, for when the panel has not arrived yet.
 
     Each character cell is two vertical pixels: the upper half block takes the foreground
-    colour and the lower half the background, so a 64x64 frame is 64 columns by 32 rows.
-    Truecolour SGR codes only, no dependencies, and it works over SSH.
+    colour and the lower half the background, which also makes each pixel roughly square
+    given typical cell proportions. So a 64x64 frame is 64 columns by 32 rows. Truecolour
+    SGR codes only, no dependencies, and it works over SSH.
+
+    By default it magnifies to fill the terminal and draws a status line underneath. It
+    renders into the alternate screen buffer so it does not clobber scrollback, except in
+    single-frame mode where leaving the alternate screen would erase the thing you asked
+    to see.
     """
 
     HALF_BLOCK = "▀"
+    RESERVED_ROWS = 2  # status line, plus one so the frame never touches the bottom edge
 
-    def __init__(self, stream: Any = None) -> None:
+    def __init__(
+        self,
+        stream: Any = None,
+        scale: int | None = None,
+        grid: bool = False,
+        status: Callable[[], str] | None = None,
+        alt_screen: bool = True,
+        terminal_size: tuple[int, int] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.stream = stream if stream is not None else sys.stdout
+        self.scale = scale
+        self.grid = grid
+        self.status = status
+        self.alt_screen = alt_screen
+        self.terminal_size = terminal_size
+        self._clock = clock
         self._started = False
+        self._fps = 0.0
+        self._last_shown_at: float | None = None
+
+    def _resolve_scale(self, frame_size: tuple[int, int]) -> int:
+        if self.scale is not None:
+            return self.scale
+        size = self.terminal_size or tuple(shutil.get_terminal_size((80, 24)))
+        return terminal_scale_for(frame_size, size, self.RESERVED_ROWS)
+
+    def _warn_if_clipped(self, frame_size: tuple[int, int]) -> None:
+        columns, rows = self.terminal_size or tuple(shutil.get_terminal_size((80, 24)))
+        needed_rows = frame_size[1] // 2 + self.RESERVED_ROWS
+        if columns < frame_size[0] or rows < needed_rows:
+            # Warn on stderr before the alternate screen swallows it.
+            print(
+                f"Warning: terminal is {columns}x{rows}; an unscaled {frame_size[0]}x"
+                f"{frame_size[1]} frame needs {frame_size[0]}x{needed_rows}. "
+                "The preview will be clipped until you resize.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     @classmethod
     def frame_to_text(cls, image: Image.Image) -> str:
@@ -836,19 +900,52 @@ class TerminalDisplay:
             lines.append("".join(parts) + "\x1b[0m")
         return "\n".join(lines)
 
+    def _measure_fps(self) -> None:
+        now = self._clock()
+        if self._last_shown_at is not None:
+            delta = now - self._last_shown_at
+            if delta > 0:
+                instant = 1.0 / delta
+                # Lightly smoothed, or the reading jitters too much to read.
+                self._fps = instant if self._fps == 0.0 else self._fps * 0.8 + instant * 0.2
+        self._last_shown_at = now
+
+    def status_line(self) -> str:
+        parts = [self.status()] if self.status else []
+        if self._fps > 0:
+            parts.append(f"{self._fps:.1f} fps")
+        parts.append("ctrl-c to stop")
+        return " · ".join(part for part in parts if part)
+
     def show(self, image: Image.Image) -> None:
         if not self._started:
-            self.stream.write("\x1b[2J\x1b[?25l")  # clear screen, hide cursor
+            self._warn_if_clipped(image.size)
+            if self.alt_screen:
+                self.stream.write("\x1b[?1049h")  # alternate screen, preserves scrollback
+            self.stream.write("\x1b[2J\x1b[?25l")  # clear, hide cursor
             self._started = True
-        # Home the cursor and overwrite in place rather than scrolling.
-        self.stream.write("\x1b[H" + self.frame_to_text(image) + "\n")
+
+        self._measure_fps()
+        frame = scale_for_preview(image, self._resolve_scale(image.size), self.grid)
+        # Home the cursor and overwrite in place rather than scrolling. \x1b[J at the end
+        # erases anything left over from a larger previous frame.
+        self.stream.write(
+            "\x1b[H"
+            + self.frame_to_text(frame)
+            + f"\n\x1b[2m{self.status_line()}\x1b[0m\x1b[K\n\x1b[J"
+        )
         self.stream.flush()
 
     def clear(self) -> None:
-        if self._started:
-            self.stream.write("\x1b[0m\x1b[?25h\n")  # reset colours, show cursor
-            self.stream.flush()
-            self._started = False
+        if not self._started:
+            return
+        self.stream.write("\x1b[0m\x1b[?25h")  # reset colours, show cursor
+        if self.alt_screen:
+            self.stream.write("\x1b[?1049l")  # back to the shell, scrollback intact
+        else:
+            self.stream.write("\n")
+        self.stream.flush()
+        self._started = False
 
     def __enter__(self) -> TerminalDisplay:
         return self
@@ -932,15 +1029,29 @@ def matrix_options_from(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def build_display(args: argparse.Namespace) -> Display:
-    """Pick an output backend. The three preview backends are mutually exclusive."""
+def build_display(
+    args: argparse.Namespace, status: Callable[[], str] | None = None
+) -> Display:
+    """Pick an output backend. The three preview backends are mutually exclusive.
+
+    `--preview-scale` defaults to None, which means 1x for the file backends and
+    fill-the-window for the terminal.
+    """
     if args.mock_output:
-        return MockDisplay(args.mock_output, scale=args.preview_scale, grid=args.preview_grid)
+        return MockDisplay(
+            args.mock_output, scale=args.preview_scale or 1, grid=args.preview_grid
+        )
     if args.preview_terminal:
-        return TerminalDisplay()
+        return TerminalDisplay(
+            scale=args.preview_scale,
+            grid=args.preview_grid,
+            status=status,
+            # Leaving the alternate screen would erase the single frame we just drew.
+            alt_screen=not args.once,
+        )
     if args.record_gif:
         return GifRecorderDisplay(
-            args.record_gif, fps=args.fps, scale=args.preview_scale, grid=args.preview_grid
+            args.record_gif, fps=args.fps, scale=args.preview_scale or 1, grid=args.preview_grid
         )
     return MatrixDisplay(**matrix_options_from(args))
 
@@ -1474,6 +1585,21 @@ def validate_args(args: argparse.Namespace) -> None:
         )
 
 
+def playback_status(provider_name: str, style: str, state: PlaybackState) -> str:
+    """One-line summary of what the display is doing, for the terminal preview."""
+    art, is_playing = state.snapshot()
+    if art is None:
+        playback = "idle"
+    else:
+        playback = "playing" if is_playing else "paused"
+
+    parts = [provider_name, style, playback]
+    track = state.art_key
+    if track:
+        parts.append(track if len(track) <= 40 else track[:39] + "…")
+    return " · ".join(parts)
+
+
 def frame_budget(args: argparse.Namespace) -> int | None:
     """How many frames to show before stopping, or None to run until interrupted."""
     if args.once:
@@ -1485,7 +1611,9 @@ def frame_budget(args: argparse.Namespace) -> int | None:
 
 def run(args: argparse.Namespace) -> None:
     if args.preview_frames:
-        render_preview_frames(args.preview_frames, style=args.style, scale=args.preview_scale)
+        render_preview_frames(
+            args.preview_frames, style=args.style, scale=args.preview_scale or 1
+        )
         return
 
     validate_args(args)
@@ -1497,7 +1625,7 @@ def run(args: argparse.Namespace) -> None:
     # --test-pattern is the hardware bring-up path: it must work before any provider
     # credentials exist, so build/authorize the provider only when we actually need it.
     if args.test_pattern:
-        with build_display(args) as display:
+        with build_display(args, status=lambda: f"test pattern · {size}x{size}") as display:
             drive_display(
                 display,
                 TestPatternFrameSource(size),
@@ -1532,7 +1660,9 @@ def run(args: argparse.Namespace) -> None:
 
     with contextlib.ExitStack() as stack:
         # Entered before the thread starts, so a failure to start it still clears the panel.
-        display = stack.enter_context(build_display(args))
+        display = stack.enter_context(
+            build_display(args, status=lambda: playback_status(provider.name, args.style, state))
+        )
 
         poll_thread = threading.Thread(
             target=poll_provider,
@@ -1571,6 +1701,13 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be 1 or greater")
     return parsed
 
 
@@ -1662,9 +1799,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--preview-scale",
-        type=int,
-        default=1,
-        help="Nearest-neighbour magnification for PNG, GIF and --preview-frames output.",
+        type=positive_int,
+        default=None,
+        help=(
+            "Nearest-neighbour magnification for preview output. "
+            "Defaults to 1 for files and to filling the window for --preview-terminal."
+        ),
     )
     parser.add_argument(
         "--preview-grid",

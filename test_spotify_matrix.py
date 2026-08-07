@@ -1810,7 +1810,75 @@ class TestScaleForPreview(unittest.TestCase):
         self.assertEqual(with_grid.getpixel((2, 2)), (255, 255, 255))
 
 
+class TestTerminalScaleFor(unittest.TestCase):
+    def test_accounts_for_two_pixel_rows_per_character_row(self):
+        # 64x64 at scale 3 needs 192 columns and 96 pixel rows = 96 character rows... no:
+        # 64*3 = 192 pixel rows over 2 = 96 character rows, so 98 rows with the reserve.
+        self.assertEqual(sm.terminal_scale_for((64, 64), (192, 98), reserved_rows=2), 3)
+
+    def test_limited_by_width(self):
+        self.assertEqual(sm.terminal_scale_for((64, 64), (128, 999), reserved_rows=2), 2)
+
+    def test_limited_by_height(self):
+        self.assertEqual(sm.terminal_scale_for((64, 64), (9999, 66), reserved_rows=2), 2)
+
+    def test_never_returns_less_than_one(self):
+        self.assertEqual(sm.terminal_scale_for((64, 64), (10, 4), reserved_rows=2), 1)
+
+    def test_reserved_rows_are_subtracted(self):
+        # 64 rows is exactly enough for scale 2 (128 pixel rows) with nothing held back,
+        # but not once the status line is reserved.
+        self.assertEqual(sm.terminal_scale_for((64, 64), (9999, 64), reserved_rows=0), 2)
+        self.assertEqual(sm.terminal_scale_for((64, 64), (9999, 64), reserved_rows=2), 1)
+        self.assertEqual(sm.terminal_scale_for((64, 64), (9999, 66), reserved_rows=2), 2)
+
+    def test_a_typical_full_screen_terminal_gets_real_magnification(self):
+        self.assertGreaterEqual(sm.terminal_scale_for((64, 64), (204, 60)), 1)
+        self.assertEqual(sm.terminal_scale_for((64, 64), (204, 60)), 1)
+        self.assertEqual(sm.terminal_scale_for((64, 64), (256, 100)), 3)
+
+
+class TestPlaybackStatus(unittest.TestCase):
+    def test_idle(self):
+        self.assertEqual(
+            sm.playback_status("demo", "record", sm.PlaybackState()), "demo · record · idle"
+        )
+
+    def test_playing_includes_the_track(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("Massive Attack - Teardrop", "u", True), art_image())
+        self.assertEqual(
+            sm.playback_status("lastfm", "art", state),
+            "lastfm · art · playing · Massive Attack - Teardrop",
+        )
+
+    def test_paused(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("k", "u", False), art_image())
+        self.assertIn("paused", sm.playback_status("spotify", "record", state))
+
+    def test_long_track_keys_are_truncated(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("x" * 200, "u", True), art_image())
+        line = sm.playback_status("spotify", "record", state)
+        self.assertIn("…", line)
+        self.assertLess(len(line), 80)
+
+    def test_cleared_state_reports_idle_without_a_stale_track(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("gone", "u", True), art_image())
+        state.clear()
+        self.assertNotIn("gone", sm.playback_status("spotify", "record", state))
+
+
 class TestTerminalDisplay(unittest.TestCase):
+    """Instances pin scale and terminal_size so results never depend on the test runner."""
+
+    def display(self, stream=None, **kwargs):
+        kwargs.setdefault("scale", 1)
+        kwargs.setdefault("terminal_size", (200, 60))
+        return sm.TerminalDisplay(stream=stream if stream is not None else io.StringIO(), **kwargs)
+
     def test_two_pixel_rows_per_character_row(self):
         text = sm.TerminalDisplay.frame_to_text(art_image(size=(64, 64)))
         self.assertEqual(len(text.split("\n")), 32)
@@ -1841,7 +1909,7 @@ class TestTerminalDisplay(unittest.TestCase):
 
     def test_show_homes_the_cursor_instead_of_scrolling(self):
         stream = io.StringIO()
-        display = sm.TerminalDisplay(stream=stream)
+        display = self.display(stream)
         display.show(art_image(size=(4, 4)))
         first = stream.getvalue()
         display.show(art_image(size=(4, 4)))
@@ -1853,21 +1921,139 @@ class TestTerminalDisplay(unittest.TestCase):
 
     def test_clear_restores_the_cursor(self):
         stream = io.StringIO()
-        display = sm.TerminalDisplay(stream=stream)
+        display = self.display(stream)
         display.show(art_image(size=(4, 4)))
         display.clear()
         self.assertIn("\x1b[?25h", stream.getvalue())
 
     def test_clear_is_a_no_op_before_any_frame(self):
         stream = io.StringIO()
-        sm.TerminalDisplay(stream=stream).clear()
+        self.display(stream).clear()
         self.assertEqual(stream.getvalue(), "")
 
     def test_context_manager_restores_the_cursor_on_exit(self):
         stream = io.StringIO()
-        with sm.TerminalDisplay(stream=stream) as display:
+        with self.display(stream) as display:
             display.show(art_image(size=(4, 4)))
         self.assertIn("\x1b[?25h", stream.getvalue())
+
+    def test_erases_below_so_a_smaller_frame_leaves_no_debris(self):
+        stream = io.StringIO()
+        self.display(stream).show(art_image(size=(4, 4)))
+        self.assertTrue(stream.getvalue().endswith("\x1b[J"))
+
+    # --- magnification -----------------------------------------------------------------
+
+    def test_auto_fit_magnifies_to_the_terminal(self):
+        stream = io.StringIO()
+        sm.TerminalDisplay(stream=stream, scale=None, terminal_size=(256, 100)).show(
+            art_image(size=(64, 64))
+        )
+        # scale 3 => a 192x192 frame => 192 columns by 96 character rows
+        self.assertEqual(stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK), 192 * 96)
+
+    def test_explicit_scale_overrides_auto_fit(self):
+        stream = io.StringIO()
+        sm.TerminalDisplay(stream=stream, scale=1, terminal_size=(9999, 9999)).show(
+            art_image(size=(64, 64))
+        )
+        self.assertEqual(stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK), 64 * 32)
+
+    def test_auto_fit_falls_back_to_one_in_a_small_terminal(self):
+        stream = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()):
+            sm.TerminalDisplay(stream=stream, scale=None, terminal_size=(80, 24)).show(
+                art_image(size=(64, 64))
+            )
+        self.assertEqual(stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK), 64 * 32)
+
+    def test_grid_reaches_the_terminal_output(self):
+        plain = io.StringIO()
+        gridded = io.StringIO()
+        art = art_image((255, 255, 255), (8, 8))
+        sm.TerminalDisplay(stream=plain, scale=4, terminal_size=(200, 60)).show(art)
+        sm.TerminalDisplay(stream=gridded, scale=4, grid=True, terminal_size=(200, 60)).show(art)
+        self.assertNotEqual(plain.getvalue(), gridded.getvalue())
+        self.assertIn("38;2;0;0;0", gridded.getvalue(), "gutter is drawn black")
+
+    def test_warns_once_when_the_terminal_is_too_small(self):
+        stream, errors = io.StringIO(), io.StringIO()
+        display = sm.TerminalDisplay(stream=stream, scale=1, terminal_size=(40, 10))
+        with contextlib.redirect_stderr(errors):
+            display.show(art_image(size=(64, 64)))
+            display.show(art_image(size=(64, 64)))
+        self.assertEqual(errors.getvalue().count("Warning"), 1)
+        self.assertIn("40x10", errors.getvalue())
+
+    def test_no_warning_when_it_fits(self):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.display().show(art_image(size=(64, 64)))
+        self.assertEqual(errors.getvalue(), "")
+
+    # --- status line -------------------------------------------------------------------
+
+    def test_status_callable_is_rendered_under_the_frame(self):
+        stream = io.StringIO()
+        self.display(stream, status=lambda: "demo · record · playing").show(art_image(size=(4, 4)))
+        self.assertIn("demo · record · playing", stream.getvalue())
+
+    def test_status_is_re_read_every_frame(self):
+        stream = io.StringIO()
+        states = iter(["first", "second"])
+        display = self.display(stream, status=lambda: next(states))
+        display.show(art_image(size=(4, 4)))
+        display.show(art_image(size=(4, 4)))
+        self.assertIn("first", stream.getvalue())
+        self.assertIn("second", stream.getvalue())
+
+    def test_status_line_includes_the_stop_hint(self):
+        self.assertIn("ctrl-c", self.display().status_line())
+
+    def test_no_fps_reading_on_the_first_frame(self):
+        display = self.display(clock=FakeClock())
+        display.show(art_image(size=(4, 4)))
+        self.assertNotIn("fps", display.status_line())
+
+    def test_fps_is_measured_from_frame_intervals(self):
+        clock = FakeClock()
+        display = self.display(clock=clock)
+        display.show(art_image(size=(4, 4)))
+        for _ in range(40):
+            clock.advance(0.05)  # 20 fps
+            display.show(art_image(size=(4, 4)))
+        self.assertIn("20.0 fps", display.status_line())
+
+    def test_works_without_a_status_callable(self):
+        stream = io.StringIO()
+        self.display(stream, status=None).show(art_image(size=(4, 4)))
+        self.assertIn("ctrl-c", stream.getvalue())
+
+    # --- alternate screen --------------------------------------------------------------
+
+    def test_uses_the_alternate_screen_to_preserve_scrollback(self):
+        stream = io.StringIO()
+        with self.display(stream, alt_screen=True) as display:
+            display.show(art_image(size=(4, 4)))
+        output = stream.getvalue()
+        self.assertIn("\x1b[?1049h", output, "enters the alternate screen")
+        self.assertIn("\x1b[?1049l", output, "and leaves it on the way out")
+        self.assertLess(output.index("\x1b[?1049h"), output.index("\x1b[?1049l"))
+
+    def test_single_frame_mode_stays_on_the_main_screen(self):
+        """Leaving the alternate screen would erase the one frame you asked to see."""
+        stream = io.StringIO()
+        with self.display(stream, alt_screen=False) as display:
+            display.show(art_image(size=(4, 4)))
+        self.assertNotIn("\x1b[?1049", stream.getvalue())
+
+    def test_alternate_screen_is_left_even_if_the_body_raises(self):
+        stream = io.StringIO()
+        with contextlib.suppress(ValueError):
+            with self.display(stream, alt_screen=True) as display:
+                display.show(art_image(size=(4, 4)))
+                raise ValueError("boom")
+        self.assertIn("\x1b[?1049l", stream.getvalue())
 
 
 class TestGifRecorderDisplay(unittest.TestCase):
@@ -1949,6 +2135,40 @@ class TestBuildDisplayBackends(unittest.TestCase):
 
     def test_preview_terminal_selects_the_terminal_backend(self):
         self.assertIsInstance(sm.build_display(self.parse(["--preview-terminal"])), sm.TerminalDisplay)
+
+    def test_terminal_uses_the_alternate_screen_for_a_live_preview(self):
+        self.assertTrue(sm.build_display(self.parse(["--preview-terminal"])).alt_screen)
+
+    def test_terminal_stays_on_the_main_screen_for_a_single_frame(self):
+        """--once must not enter the alternate screen; exiting would erase the frame."""
+        display = sm.build_display(self.parse(["--preview-terminal", "--once"]))
+        self.assertFalse(display.alt_screen)
+
+    def test_terminal_scale_defaults_to_auto_fit(self):
+        self.assertIsNone(sm.build_display(self.parse(["--preview-terminal"])).scale)
+
+    def test_terminal_takes_an_explicit_scale_and_grid(self):
+        display = sm.build_display(
+            self.parse(["--preview-terminal", "--preview-scale", "5", "--preview-grid"])
+        )
+        self.assertEqual((display.scale, display.grid), (5, True))
+
+    def test_status_callable_is_handed_to_the_terminal_backend(self):
+        display = sm.build_display(self.parse(["--preview-terminal"]), status=lambda: "hello")
+        self.assertEqual(display.status(), "hello")
+
+    def test_file_backends_default_to_unscaled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            png = sm.build_display(self.parse(["--mock-output", str(Path(tmp) / "f.png")]))
+            gif = sm.build_display(self.parse(["--record-gif", str(Path(tmp) / "a.gif")]))
+        self.assertEqual(png.scale, 1)
+        self.assertEqual(gif.scale, 1)
+
+    def test_preview_scale_must_be_at_least_one(self):
+        for value in ("0", "-3"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit), quiet():
+                    self.parse(["--preview-scale", value])
 
     def test_record_gif_selects_the_recorder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2164,10 +2384,23 @@ class TestPreviewEndToEnd(unittest.TestCase):
         stream = io.StringIO()
         args = sm.build_parser().parse_args(["--provider", "demo", "--preview-terminal", "--once"])
         real = sm.TerminalDisplay  # capture before patching, or the lambda recurses
-        with mock.patch.object(sm, "TerminalDisplay", lambda: real(stream=stream)), quiet():
+        factory = lambda **kwargs: real(stream=stream, terminal_size=(200, 60), **kwargs)
+        with mock.patch.object(sm, "TerminalDisplay", factory), quiet():
             sm.run(args)
         self.assertIn(sm.TerminalDisplay.HALF_BLOCK, stream.getvalue())
         self.assertIn("\x1b[38;2;", stream.getvalue())
+
+    def test_terminal_preview_reports_live_playback_state(self):
+        """run() must wire the status callable through, or the HUD is empty."""
+        stream = io.StringIO()
+        args = sm.build_parser().parse_args(
+            ["--provider", "demo", "--style", "art", "--preview-terminal", "--once"]
+        )
+        real = sm.TerminalDisplay
+        factory = lambda **kwargs: real(stream=stream, terminal_size=(200, 60), **kwargs)
+        with mock.patch.object(sm, "TerminalDisplay", factory), quiet():
+            sm.run(args)
+        self.assertIn("demo · art · playing · demo-track", stream.getvalue())
 
     def test_scaled_grid_preview_is_written_at_the_requested_size(self):
         output = self.dir / "big.png"

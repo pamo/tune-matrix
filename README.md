@@ -166,12 +166,40 @@ Pi Zero. `--rpm` only affects `record`.
 You do not need the panel to see exactly what it will show. All of these work with the
 real Spotify and Last.fm connections, so you can watch live playback drive the display.
 
-**Live in the terminal.** Each character cell is two vertical pixels via truecolour
-half-blocks, so a 64x64 frame is 64x32 characters. No dependencies, works over SSH:
+### Live in the terminal
+
+The most useful one. Each character cell holds two vertical pixels via truecolour
+half-blocks, which also makes each pixel come out roughly square, so a 64x64 frame is 64
+columns by 32 rows. No dependencies, and it works over SSH.
 
 ```bash
 python spotify_matrix.py --preview-terminal
 ```
+
+It magnifies to fill the window, draws a status line underneath, and renders into the
+alternate screen buffer so your scrollback survives. Ctrl-C restores the terminal.
+
+```
+lastfm · record · playing · Massive Attack - Teardrop · 20.0 fps · ctrl-c to stop
+```
+
+That line is the reason this is a debugging tool and not just a toy: it shows which
+provider answered, which style is active, whether playback is playing / paused / idle, the
+current track key, and the frame rate you are really achieving.
+
+Notes worth knowing:
+
+- **Magnification is limited by terminal height**, because each character row carries two
+  pixel rows. A 64x64 frame needs 32 rows at 1x and 96 at 3x, so you want a tall window
+  (~100 rows) before scaling kicks in. `--preview-scale N` overrides the automatic choice,
+  and the preview warns on stderr if the frame will be clipped.
+- `--preview-grid` works here too, drawing the inter-pixel gutter.
+- A frame is roughly 25 KB of escape codes, so 20 fps is ~500 KB/s. Over a slow SSH link
+  use `--fps 10` or lower.
+- `--once` deliberately stays on the main screen, since leaving the alternate screen would
+  erase the single frame you asked to see.
+
+### Other preview outputs
 
 **No credentials at all.** `--provider demo` invents playback locally and cycles
 playing → paused → nothing playing, so every state the panel can be in shows up in one
@@ -206,7 +234,8 @@ python spotify_matrix.py --preview-frames /tmp/preview --style art
 
 `--mock-output`, `--preview-terminal` and `--record-gif` are mutually exclusive; without
 one of them the script drives real matrix hardware. `--preview-scale` and `--preview-grid`
-apply to all of the file-writing outputs.
+apply to every preview output, and `--preview-scale` defaults to 1x for files and to
+fill-the-window for the terminal.
 
 Two notes. A bounded render (`--once`, `--record-gif`) waits briefly for the first poll to
 land, so previews show real album art rather than the idle frame; the live path does not
