@@ -34,6 +34,7 @@ TOKEN_URL = "https://accounts.spotify.com/api/token"
 CURRENTLY_PLAYING_URL = "https://api.spotify.com/v1/me/player/currently-playing"
 SCOPE = "user-read-currently-playing"
 LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
+LASTFM_PLACEHOLDER_ART_ID = "2a96cbd8b46e442fc41c2b86b821562f"
 
 
 @dataclass
@@ -53,7 +54,10 @@ class SharedPlaybackState:
 
 @dataclass
 class RenderCache:
-    art_id: int | None = None
+    # Holds the source art itself rather than its id(): a bare id() can dangle once the
+    # art is dropped (playback stops), and a later album allocated at the same address
+    # would falsely hit the cache and render the previous cover.
+    source_art: Image.Image | None = None
     disc_size: int | None = None
     fitted_art: Image.Image | None = None
     disc_mask: Image.Image | None = None
@@ -194,7 +198,10 @@ class SpotifyClient:
         try:
             os.chmod(self.token_cache, 0o600)
         except OSError as exc:
-            raise RuntimeError(f"Unable to secure Spotify token cache permissions: {self.token_cache}") from exc
+            # Tightening permissions is best-effort. Some filesystems (and a cache written
+            # under sudo but read as another user) reject chmod, and refusing to start over
+            # that would strand the display on a working token.
+            print(f"Warning: could not tighten permissions on {self.token_cache}: {exc}", flush=True)
 
         try:
             with self.token_cache.open("r", encoding="utf-8") as token_file:
@@ -379,7 +386,9 @@ def select_lastfm_image_url(images: list[dict[str, Any]]) -> str | None:
     best_rank = -1
     for image in images:
         url = (image.get("#text") or "").strip()
-        if not url:
+        if not url or LASTFM_PLACEHOLDER_ART_ID in url:
+            # Last.fm serves a generic grey star for tracks it has no cover for. Treat it
+            # as "no art" so the display goes idle instead of spinning the placeholder.
             continue
         rank = size_rank.get(image.get("size", ""), -1)
         if rank >= best_rank:
@@ -638,7 +647,7 @@ def render_record(
     disc_size = size - margin * 2
     if (
         cache
-        and cache.art_id == id(art)
+        and cache.source_art is art
         and cache.disc_size == disc_size
         and cache.fitted_art is not None
         and cache.disc_mask is not None
@@ -652,7 +661,7 @@ def render_record(
         mask_draw = ImageDraw.Draw(disc_mask)
         mask_draw.ellipse((0, 0, disc_size - 1, disc_size - 1), fill=255)
         if cache:
-            cache.art_id = id(art)
+            cache.source_art = art
             cache.disc_size = disc_size
             cache.fitted_art = art_square
             cache.disc_mask = disc_mask
@@ -825,6 +834,25 @@ def run(args: argparse.Namespace) -> None:
 
     load_dotenv()
 
+    display: MatrixDisplay | MockDisplay
+    size = min(args.rows, args.cols)
+
+    # --test-pattern is the hardware bring-up path: it must work before any provider
+    # credentials exist, so build/authorize the provider only when we actually need it.
+    if args.test_pattern:
+        display = MockDisplay(args.mock_output) if args.mock_output else MatrixDisplay(args)
+        try:
+            offset = 0
+            while True:
+                display.show(render_test_pattern(size, offset))
+                offset = (offset + 1) % size
+                time.sleep(1.0 / args.fps)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            display.clear()
+        return
+
     provider = build_provider(args)
 
     try:
@@ -841,26 +869,7 @@ def run(args: argparse.Namespace) -> None:
             print("Last.fm API key and user verified.")
         return
 
-    display: MatrixDisplay | MockDisplay
-    if args.mock_output:
-        display = MockDisplay(args.mock_output)
-    else:
-        display = MatrixDisplay(args)
-
-    size = min(args.rows, args.cols)
-
-    if args.test_pattern:
-        try:
-            offset = 0
-            while True:
-                display.show(render_test_pattern(size, offset))
-                offset = (offset + 1) % size
-                time.sleep(1.0 / args.fps)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            display.clear()
-        return
+    display = MockDisplay(args.mock_output) if args.mock_output else MatrixDisplay(args)
 
     idle = render_idle(size)
     render_cache = RenderCache()

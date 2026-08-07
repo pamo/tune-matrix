@@ -72,9 +72,16 @@ Then run with `--provider lastfm`.
 
 ## YouTube Music setup
 
-Install dependencies, then create auth headers with `ytmusicapi` and save the JSON file (default path `.cache/ytmusic_auth.json` or `YTMUSIC_AUTH_HEADERS_PATH`).
+`ytmusicapi` is an optional dependency — it is commented out in `requirements.txt` so the
+default install stays small on a Pi Zero. Install it explicitly for this provider:
 
-Then run with `--provider youtube-music`.
+```bash
+pip install "ytmusicapi>=1.8"
+```
+
+Then create auth headers with `ytmusicapi` and save the JSON file (default path
+`.cache/ytmusic_auth.json`, or set `YTMUSIC_AUTH_HEADERS_PATH`), and run with
+`--provider youtube-music`.
 
 ## Run
 
@@ -106,6 +113,13 @@ sudo -E .venv/bin/python spotify_matrix.py \
   --hardware-mapping regular \
   --gpio-slowdown 2 \
   --brightness 65
+```
+
+To bring up new panel wiring, show a moving colour test pattern. This needs no provider
+credentials and makes no network calls, so it is the first thing to run on a fresh Pi:
+
+```bash
+sudo -E .venv/bin/python spotify_matrix.py --test-pattern
 ```
 
 For a non-Pi test that writes one PNG frame instead of using matrix hardware:
