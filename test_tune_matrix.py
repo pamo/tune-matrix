@@ -1248,7 +1248,7 @@ class TestPollProvider(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             sm.poll_provider(provider, sm.PlaybackState(), stop_event, 0.0, lambda url: art_image())
         self.assertEqual(buffer.getvalue().count("art found"), 2)
-        self.assertEqual(buffer.getvalue().count("no playback item"), 1)
+        self.assertEqual(buffer.getvalue().count("nothing playing"), 1)
 
     def test_stops_promptly_when_the_stop_event_is_already_set(self):
         stop_event = threading.Event()

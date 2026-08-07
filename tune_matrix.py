@@ -1745,7 +1745,9 @@ def poll_provider(
                 report(f"art found, is_playing={art.is_playing}")
             else:
                 state.clear()
-                report("no playback item")
+                # Says nothing is playing, not that anything failed: this is the normal
+                # state most of the day, and the panel is showing its idle scene.
+                report("nothing playing")
         except ProviderRateLimitError as exc:
             report(f"rate limited, retrying in {exc.retry_after_seconds}s")
             stop_event.wait(max(poll_seconds, float(exc.retry_after_seconds)))
