@@ -1,6 +1,13 @@
 # Now Playing Matrix
 
-Shows current album art on a 64x64 RGB matrix as a circular record. The album art is the record surface itself: it is cropped to a disk, spun while playback is active, and left stopped at the current angle when paused.
+Shows current album art on a 64x64 RGB matrix, either as a spinning record or as static
+full-bleed art (see [Display style](#display-style)). In the default record style the album
+art is the record surface itself: cropped to a disk, spun while playback is active, and
+left stopped at the current angle when paused.
+
+You do not need the panel to work on this — see
+[Previewing without a matrix](#previewing-without-a-matrix) for a live terminal preview, GIF
+recording, and a credential-free demo mode.
 
 Supported providers:
 
@@ -8,6 +15,7 @@ Supported providers:
 - `lastfm`: Last.fm "now scrobbling" — universal best-effort provider that works for **any**
   service you scrobble (Spotify, Apple Music, Tidal, Deezer, YouTube Music, ...)
 - `youtube-music`: YouTube Music history via `ytmusicapi`
+- `demo`: synthetic playback for previewing the display with no credentials and no network
 
 > **Apple Music has no direct API support** (see [Music provider support](#music-provider-support)),
 > but you can still display it: scrobble Apple Music to Last.fm and run `--provider lastfm`.
@@ -137,17 +145,73 @@ credentials and makes no network calls, so it is the first thing to run on a fre
 sudo -E .venv/bin/python spotify_matrix.py --test-pattern
 ```
 
-For a non-Pi test that writes one PNG frame instead of using matrix hardware:
+## Display style
+
+`--style` picks what the panel shows:
+
+| Style | What you get |
+| --- | --- |
+| `record` (default) | Album art cut into a circular disc that spins while playback is active, with a centre label and spindle hole. |
+| `art` | Album art static and full-bleed, edge to edge. No disc, no rotation. |
 
 ```bash
-python spotify_matrix.py --mock-output /tmp/spotify-matrix-frame.png --once
+sudo -E .venv/bin/python spotify_matrix.py --style art
 ```
 
-To verify the album art is what spins on the disk, render four local preview frames:
+`--style art` does no per-frame work at all, so `--fps 2` is plenty and saves CPU on a
+Pi Zero. `--rpm` only affects `record`.
+
+## Previewing without a matrix
+
+You do not need the panel to see exactly what it will show. All of these work with the
+real Spotify and Last.fm connections, so you can watch live playback drive the display.
+
+**Live in the terminal.** Each character cell is two vertical pixels via truecolour
+half-blocks, so a 64x64 frame is 64x32 characters. No dependencies, works over SSH:
 
 ```bash
-python spotify_matrix.py --preview-frames /tmp/spotify-matrix-preview
+python spotify_matrix.py --preview-terminal
 ```
+
+**No credentials at all.** `--provider demo` invents playback locally and cycles
+playing → paused → nothing playing, so every state the panel can be in shows up in one
+run. Nothing is downloaded:
+
+```bash
+python spotify_matrix.py --provider demo --preview-terminal
+python spotify_matrix.py --provider demo --style art --demo-cycle-seconds 3
+```
+
+**Record an animation.** Writes a looping GIF, which is the easiest way to judge whether
+the spin speed looks right:
+
+```bash
+python spotify_matrix.py --provider demo --record-gif /tmp/spin.gif --record-seconds 6
+```
+
+**A single frame, magnified.** `--preview-scale` magnifies with nearest-neighbour so the
+pixels stay crisp, and `--preview-grid` draws the inter-pixel gutter, which approximates
+how the panel reads behind a diffusion layer:
+
+```bash
+python spotify_matrix.py --mock-output /tmp/frame.png --preview-scale 8 --preview-grid --once
+```
+
+**Static sample frames**, no provider and no network:
+
+```bash
+python spotify_matrix.py --preview-frames /tmp/preview --preview-scale 6
+python spotify_matrix.py --preview-frames /tmp/preview --style art
+```
+
+`--mock-output`, `--preview-terminal` and `--record-gif` are mutually exclusive; without
+one of them the script drives real matrix hardware. `--preview-scale` and `--preview-grid`
+apply to all of the file-writing outputs.
+
+Two notes. A bounded render (`--once`, `--record-gif`) waits briefly for the first poll to
+land, so previews show real album art rather than the idle frame; the live path does not
+wait and fills in as soon as the provider answers. And GIF is limited to 256 colours per
+frame, so album art is quantised in a recording but not on the panel.
 
 ## Behaviour when things go wrong
 

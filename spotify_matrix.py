@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import tempfile
@@ -482,6 +483,37 @@ class YouTubeMusicClient:
         )
 
 
+class DemoProvider:
+    """Synthetic playback, for previewing the display without credentials or hardware.
+
+    Cycles playing -> paused -> nothing playing on a fixed period so every state the panel
+    can be in is reachable in one run. The art it reports is generated locally, so nothing
+    is downloaded (see `build_image_preparer`).
+    """
+
+    DEMO_IMAGE_URL = "demo://album-art"
+
+    def __init__(self, cycle_seconds: float = 6.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self.name = "demo"
+        self.cycle_seconds = cycle_seconds
+        self._clock = clock
+        self._start = clock()
+
+    def authorize(self) -> None:
+        return None
+
+    def get_playback_art(self) -> PlaybackArt | None:
+        elapsed = self._clock() - self._start
+        phase = int(elapsed / self.cycle_seconds) % 3
+        if phase == 2:
+            return None
+        return PlaybackArt(
+            key="demo-track",
+            image_url=self.DEMO_IMAGE_URL,
+            is_playing=phase == 0,
+        )
+
+
 def select_lastfm_image_url(images: list[dict[str, Any]]) -> str | None:
     size_rank = {"small": 0, "medium": 1, "large": 2, "extralarge": 3, "mega": 4}
     best_url: str | None = None
@@ -721,16 +753,40 @@ class MatrixDisplay:
         self.clear()
 
 
+def scale_for_preview(image: Image.Image, scale: int, grid: bool = False) -> Image.Image:
+    """Blow a 64x64 frame up to something you can actually look at.
+
+    Nearest-neighbour on purpose: the point of a pixel-art display is the pixels, and any
+    smoothing filter would hide exactly what you are trying to judge. `grid` draws the
+    inter-pixel gutter, which approximates how the panel reads behind a diffuser.
+    """
+    if scale <= 1:
+        return image
+
+    scaled = image.resize((image.width * scale, image.height * scale), Image.Resampling.NEAREST)
+    if grid and scale >= 3:
+        draw = ImageDraw.Draw(scaled)
+        for x in range(0, scaled.width, scale):
+            draw.line((x, 0, x, scaled.height), fill=(0, 0, 0))
+        for y in range(0, scaled.height, scale):
+            draw.line((0, y, scaled.width, y), fill=(0, 0, 0))
+    return scaled
+
+
 class MockDisplay:
-    def __init__(self, output: Path) -> None:
+    """Writes the current frame to a PNG."""
+
+    def __init__(self, output: Path, scale: int = 1, grid: bool = False) -> None:
         self.output = output
+        self.scale = scale
+        self.grid = grid
         self.output.parent.mkdir(parents=True, exist_ok=True)
 
     def show(self, image: Image.Image) -> None:
         # Replaced atomically: without --once this rewrites the file at the frame rate,
         # and a plain save lets readers observe a half-written PNG.
         temp_path = self.output.with_name(f".{self.output.name}.tmp")
-        image.save(temp_path, format="PNG")
+        scale_for_preview(image, self.scale, self.grid).save(temp_path, format="PNG")
         os.replace(temp_path, self.output)
 
     def clear(self) -> None:
@@ -743,7 +799,121 @@ class MockDisplay:
         self.clear()
 
 
-Display = MatrixDisplay | MockDisplay
+class TerminalDisplay:
+    """Live preview in the terminal, for when the panel has not arrived yet.
+
+    Each character cell is two vertical pixels: the upper half block takes the foreground
+    colour and the lower half the background, so a 64x64 frame is 64 columns by 32 rows.
+    Truecolour SGR codes only, no dependencies, and it works over SSH.
+    """
+
+    HALF_BLOCK = "▀"
+
+    def __init__(self, stream: Any = None) -> None:
+        self.stream = stream if stream is not None else sys.stdout
+        self._started = False
+
+    @classmethod
+    def frame_to_text(cls, image: Image.Image) -> str:
+        rgb = image if image.mode == "RGB" else image.convert("RGB")
+        pixels = rgb.load()
+        width, height = rgb.size
+        lines = []
+        for y in range(0, height, 2):
+            parts: list[str] = []
+            previous: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+            for x in range(width):
+                top = pixels[x, y]
+                # An odd-height frame has no bottom pixel for the final row.
+                bottom = pixels[x, y + 1] if y + 1 < height else (0, 0, 0)
+                if (top, bottom) != previous:
+                    parts.append(
+                        f"\x1b[38;2;{top[0]};{top[1]};{top[2]}"
+                        f";48;2;{bottom[0]};{bottom[1]};{bottom[2]}m"
+                    )
+                    previous = (top, bottom)
+                parts.append(cls.HALF_BLOCK)
+            lines.append("".join(parts) + "\x1b[0m")
+        return "\n".join(lines)
+
+    def show(self, image: Image.Image) -> None:
+        if not self._started:
+            self.stream.write("\x1b[2J\x1b[?25l")  # clear screen, hide cursor
+            self._started = True
+        # Home the cursor and overwrite in place rather than scrolling.
+        self.stream.write("\x1b[H" + self.frame_to_text(image) + "\n")
+        self.stream.flush()
+
+    def clear(self) -> None:
+        if self._started:
+            self.stream.write("\x1b[0m\x1b[?25h\n")  # reset colours, show cursor
+            self.stream.flush()
+            self._started = False
+
+    def __enter__(self) -> TerminalDisplay:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.clear()
+
+
+class GifRecorderDisplay:
+    """Buffers frames and writes an animated GIF on exit.
+
+    Useful for reviewing the spin speed, or for sharing what the panel will do. Note GIF
+    is limited to 256 colours per frame, so album art is quantised in the recording but
+    not on the real panel.
+    """
+
+    def __init__(self, output: Path, fps: float, scale: int = 1, grid: bool = False) -> None:
+        self.output = output
+        self.fps = fps
+        self.scale = scale
+        self.grid = grid
+        self.frames: list[Image.Image] = []
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+
+    def show(self, image: Image.Image) -> None:
+        self.frames.append(scale_for_preview(image, self.scale, self.grid).copy())
+
+    def clear(self) -> None:
+        return
+
+    def save(self) -> None:
+        if not self.frames:
+            return
+        first, *rest = self.frames
+        first.save(
+            self.output,
+            format="GIF",
+            save_all=True,
+            append_images=rest,
+            # GIF stores delays in hundredths of a second, so anything faster than 50 fps
+            # cannot be represented.
+            duration=max(20, round(1000.0 / self.fps)),
+            loop=0,
+        )
+        print(f"Wrote {len(self.frames)} frames to {self.output}", flush=True)
+
+    def __enter__(self) -> GifRecorderDisplay:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.save()
+
+
+class Display(Protocol):
+    def show(self, image: Image.Image) -> None:
+        ...
+
+    def clear(self) -> None:
+        ...
+
+    def __enter__(self) -> Any:
+        ...
+
+    def __exit__(self, *exc_info: object) -> None:
+        ...
 
 
 def matrix_options_from(args: argparse.Namespace) -> dict[str, Any]:
@@ -763,8 +933,15 @@ def matrix_options_from(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_display(args: argparse.Namespace) -> Display:
+    """Pick an output backend. The three preview backends are mutually exclusive."""
     if args.mock_output:
-        return MockDisplay(args.mock_output)
+        return MockDisplay(args.mock_output, scale=args.preview_scale, grid=args.preview_grid)
+    if args.preview_terminal:
+        return TerminalDisplay()
+    if args.record_gif:
+        return GifRecorderDisplay(
+            args.record_gif, fps=args.fps, scale=args.preview_scale, grid=args.preview_grid
+        )
     return MatrixDisplay(**matrix_options_from(args))
 
 
@@ -878,6 +1055,52 @@ def render_idle(size: int) -> Image.Image:
     return frame
 
 
+class FrameRenderer(Protocol):
+    """A display style.
+
+    `fit` is called on the poll thread when new art arrives, `render` on the frame loop.
+    `animated` tells the frame loop whether the rotation is worth advancing.
+    """
+
+    animated: bool
+
+    def fit(self, art: Image.Image) -> Image.Image:
+        ...
+
+    def idle(self) -> Image.Image:
+        ...
+
+    def render(self, fitted_art: Image.Image, angle: float) -> Image.Image:
+        ...
+
+
+class AlbumArtRenderer:
+    """Full-bleed static album art.
+
+    Cover art is square and so is the panel, so this fills it edge to edge with no disc,
+    label or rotation. `render` is effectively free: the art is already the right size and
+    mode by the time it gets here, so there is nothing to recompute per frame.
+    """
+
+    animated = False
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._idle = render_idle(size)
+
+    def fit(self, art: Image.Image) -> Image.Image:
+        fitted = ImageOps.fit(art, (self.size, self.size), method=Image.Resampling.LANCZOS)
+        return fitted if fitted.mode == "RGB" else fitted.convert("RGB")
+
+    def idle(self) -> Image.Image:
+        return self._idle
+
+    def render(self, fitted_art: Image.Image, angle: float) -> Image.Image:
+        if fitted_art.size != (self.size, self.size) or fitted_art.mode != "RGB":
+            fitted_art = self.fit(fitted_art)
+        return fitted_art
+
+
 class RecordRenderer:
     """Renders the spinning record.
 
@@ -886,6 +1109,8 @@ class RecordRenderer:
     (LANCZOS from a 640x640 download), so the poll thread does it via `fit` when a new
     track arrives, keeping it off the frame-critical path.
     """
+
+    animated = True
 
     def __init__(self, size: int) -> None:
         self.size = size
@@ -935,12 +1160,24 @@ def render_test_pattern(size: int, offset: int) -> Image.Image:
     return frame
 
 
-def render_preview_frames(directory: Path) -> None:
+RENDERER_STYLES: dict[str, Callable[[int], FrameRenderer]] = {
+    "record": RecordRenderer,
+    "art": AlbumArtRenderer,
+}
+
+
+def build_renderer(style: str, size: int) -> FrameRenderer:
+    return RENDERER_STYLES[style](size)
+
+
+def render_preview_frames(directory: Path, style: str = "record", scale: int = 1) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    renderer = RecordRenderer(64)
+    renderer = build_renderer(style, 64)
     fitted = renderer.fit(demo_album_art(96))
-    for index, angle in enumerate((0, 45, 90, 135)):
-        renderer.render(fitted, angle).save(directory / f"album-disk-{index:02d}.png")
+    angles = (0, 45, 90, 135) if renderer.animated else (0,)
+    for index, angle in enumerate(angles):
+        frame = scale_for_preview(renderer.render(fitted, angle), scale)
+        frame.save(directory / f"album-disk-{index:02d}.png")
 
 
 # --------------------------------------------------------------------------------------
@@ -968,6 +1205,8 @@ class PlaybackState:
         self._image_url = image_url
         self._image = image
         self._is_playing = is_playing
+        # Set the first time the poll thread reports anything at all, success or idle.
+        self._first_update = threading.Event()
 
     @property
     def art_key(self) -> str | None:
@@ -998,6 +1237,10 @@ class PlaybackState:
         with self._lock:
             return art.key != self._art_key or art.image_url != self._image_url
 
+    def wait_for_first_update(self, timeout: float) -> bool:
+        """Block until the poll thread has reported once. Returns False on timeout."""
+        return self._first_update.wait(timeout)
+
     def update(self, art: PlaybackArt, image: Image.Image | None) -> None:
         with self._lock:
             self._art_key = art.key
@@ -1005,6 +1248,7 @@ class PlaybackState:
             self._is_playing = art.is_playing
             if image is not None:
                 self._image = image
+        self._first_update.set()
 
     def clear(self) -> None:
         with self._lock:
@@ -1012,6 +1256,7 @@ class PlaybackState:
             self._image_url = None
             self._image = None
             self._is_playing = False
+        self._first_update.set()
 
 
 def poll_provider(
@@ -1067,7 +1312,7 @@ class RecordFrameSource:
 
     def __init__(
         self,
-        renderer: RecordRenderer,
+        renderer: FrameRenderer,
         state: PlaybackState,
         rpm: float,
         start_time: float | None = None,
@@ -1084,7 +1329,7 @@ class RecordFrameSource:
         delta = 0.0 if self._last_frame_at is None else now - self._last_frame_at
         self._last_frame_at = now
 
-        if is_playing and art is not None:
+        if is_playing and art is not None and self.renderer.animated:
             self.angle = advance_angle(self.angle, self.rpm, delta)
 
         return self.renderer.render(art, self.angle) if art is not None else self.renderer.idle()
@@ -1106,16 +1351,21 @@ def drive_display(
     next_frame: Callable[[float], Image.Image],
     *,
     fps: float,
-    once: bool,
+    max_frames: int | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
-    """Show frames at `fps` until interrupted. Cleanup is the caller's (see build_display)."""
+    """Show frames at `fps` until interrupted, or until `max_frames` have been shown.
+
+    Cleanup is the caller's, so it also happens on an early failure (see `run`).
+    """
+    shown = 0
     try:
         while True:
             frame_start = monotonic()
             display.show(next_frame(frame_start))
-            if once:
+            shown += 1
+            if max_frames is not None and shown >= max_frames:
                 return
             sleep(max(0.0, (1.0 / fps) - (monotonic() - frame_start)))
     except KeyboardInterrupt:
@@ -1153,6 +1403,10 @@ def _build_ytmusic(args: argparse.Namespace, env: dict[str, str]) -> PlaybackPro
     )
 
 
+def _build_demo(args: argparse.Namespace, env: dict[str, str]) -> PlaybackProvider:
+    return DemoProvider(cycle_seconds=args.demo_cycle_seconds)
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     required_env: tuple[str, ...]
@@ -1178,7 +1432,26 @@ PROVIDERS: dict[str, ProviderSpec] = {
         factory=_build_lastfm,
         verified_message=lambda args: "Last.fm API key and user verified.",
     ),
+    "demo": ProviderSpec(
+        required_env=(),
+        factory=_build_demo,
+        verified_message=lambda args: "Demo provider needs no credentials.",
+    ),
 }
+
+
+def build_image_preparer(
+    args: argparse.Namespace, renderer: FrameRenderer
+) -> Callable[[str], Image.Image]:
+    """Return the poll thread's download-and-resize step.
+
+    The resize happens here rather than in the frame loop because it is the expensive
+    part. The demo provider short-circuits the download entirely.
+    """
+    if args.provider == "demo":
+        art = demo_album_art(512)
+        return lambda url: renderer.fit(art)
+    return lambda url: renderer.fit(download_image(url))
 
 
 def build_provider(args: argparse.Namespace) -> PlaybackProvider:
@@ -1201,15 +1474,25 @@ def validate_args(args: argparse.Namespace) -> None:
         )
 
 
+def frame_budget(args: argparse.Namespace) -> int | None:
+    """How many frames to show before stopping, or None to run until interrupted."""
+    if args.once:
+        return 1
+    if args.record_gif:
+        return max(1, round(args.fps * args.record_seconds))
+    return None
+
+
 def run(args: argparse.Namespace) -> None:
     if args.preview_frames:
-        render_preview_frames(args.preview_frames)
+        render_preview_frames(args.preview_frames, style=args.style, scale=args.preview_scale)
         return
 
     validate_args(args)
     load_dotenv()
 
     size = min(args.rows, args.cols)
+    max_frames = frame_budget(args)
 
     # --test-pattern is the hardware bring-up path: it must work before any provider
     # credentials exist, so build/authorize the provider only when we actually need it.
@@ -1219,7 +1502,7 @@ def run(args: argparse.Namespace) -> None:
                 display,
                 TestPatternFrameSource(size),
                 fps=args.fps,
-                once=args.once,
+                max_frames=max_frames,
             )
         return
 
@@ -1243,7 +1526,7 @@ def run(args: argparse.Namespace) -> None:
         print(PROVIDERS[args.provider].verified_message(args))
         return
 
-    renderer = RecordRenderer(size)
+    renderer = build_renderer(args.style, size)
     state = PlaybackState()
     stop_event = threading.Event()
 
@@ -1258,7 +1541,7 @@ def run(args: argparse.Namespace) -> None:
                 state,
                 stop_event,
                 args.poll_seconds,
-                lambda url: renderer.fit(download_image(url)),
+                build_image_preparer(args, renderer),
             ),
             daemon=True,
         )
@@ -1270,11 +1553,17 @@ def run(args: argparse.Namespace) -> None:
 
         stack.callback(stop_polling)
 
+        if max_frames is not None:
+            # A bounded render (--once, --record-gif) is almost always a preview, so let
+            # the first poll land instead of capturing the idle frame. The live path does
+            # not wait: it shows idle immediately and fills in when the poll returns.
+            state.wait_for_first_update(timeout=max(2.0, args.poll_seconds * 2))
+
         drive_display(
             display,
             RecordFrameSource(renderer, state, args.rpm),
             fps=args.fps,
-            once=args.once,
+            max_frames=max_frames,
         )
 
 
@@ -1291,7 +1580,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         choices=tuple(PROVIDERS),
         default="spotify",
-        help="Music provider to use for album art.",
+        help="Music provider to use for album art. 'demo' needs no credentials.",
+    )
+    parser.add_argument(
+        "--style",
+        choices=tuple(RENDERER_STYLES),
+        default="record",
+        help=(
+            "How to draw the album art: 'record' spins it as a vinyl disc, "
+            "'art' shows it static and full-bleed."
+        ),
     )
     parser.add_argument("--rows", type=int, default=64)
     parser.add_argument("--cols", type=int, default=64)
@@ -1332,8 +1630,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=180.0,
         help="Maximum time to wait for Spotify OAuth callback before failing.",
     )
-    parser.add_argument("--mock-output", type=Path, help="Write the current frame PNG instead of using RGB matrix hardware.")
-    parser.add_argument("--preview-frames", type=Path, help="Render sample spinning-album-art disk frames and exit.")
+    parser.add_argument(
+        "--demo-cycle-seconds",
+        type=positive_float,
+        default=6.0,
+        help="How long the demo provider spends in each of playing / paused / idle.",
+    )
+
+    # Output backends. Exactly one destination, so argparse rejects combinations.
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
+        "--mock-output",
+        type=Path,
+        help="Write the current frame as a PNG instead of using RGB matrix hardware.",
+    )
+    output.add_argument(
+        "--preview-terminal",
+        action="store_true",
+        help="Draw live frames in the terminal using truecolour half-blocks. No hardware needed.",
+    )
+    output.add_argument(
+        "--record-gif",
+        type=Path,
+        help="Record the animation to a looping GIF and exit. See --record-seconds.",
+    )
+    parser.add_argument(
+        "--record-seconds",
+        type=positive_float,
+        default=5.0,
+        help="How long to record with --record-gif.",
+    )
+    parser.add_argument(
+        "--preview-scale",
+        type=int,
+        default=1,
+        help="Nearest-neighbour magnification for PNG, GIF and --preview-frames output.",
+    )
+    parser.add_argument(
+        "--preview-grid",
+        action="store_true",
+        help="Draw the inter-pixel gutter in scaled output, approximating the panel behind a diffuser.",
+    )
+    parser.add_argument("--preview-frames", type=Path, help="Render sample album-art frames and exit.")
     parser.add_argument(
         "--auth-only",
         action="store_true",

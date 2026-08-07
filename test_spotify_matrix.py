@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageSequence
 
 sys.argv = ["spotify_matrix"]
 import spotify_matrix as sm
@@ -1222,7 +1222,7 @@ class TestDriveDisplay(unittest.TestCase):
     def test_once_shows_exactly_one_frame(self):
         display = RecordingDisplay()
         sm.drive_display(
-            display, lambda now: art_image(), fps=20.0, once=True, sleep=self.fail_on_sleep
+            display, lambda now: art_image(), fps=20.0, max_frames=1, sleep=self.fail_on_sleep
         )
         self.assertEqual(len(display.frames), 1)
 
@@ -1233,7 +1233,7 @@ class TestDriveDisplay(unittest.TestCase):
     def test_does_not_clear_the_display_itself(self):
         # Cleanup belongs to the context manager, so it also runs on an early failure.
         display = RecordingDisplay()
-        sm.drive_display(display, lambda now: art_image(), fps=20.0, once=True)
+        sm.drive_display(display, lambda now: art_image(), fps=20.0, max_frames=1)
         self.assertEqual(display.cleared, 0)
 
     def test_paces_to_the_frame_budget(self):
@@ -1253,7 +1253,7 @@ class TestDriveDisplay(unittest.TestCase):
             display,
             next_frame,
             fps=4.0,
-            once=False,
+            max_frames=None,
             monotonic=lambda: next(clock),
             sleep=slept.append,
         )
@@ -1274,7 +1274,7 @@ class TestDriveDisplay(unittest.TestCase):
             return art_image()
 
         sm.drive_display(
-            display, next_frame, fps=20.0, once=False,
+            display, next_frame, fps=20.0, max_frames=None,
             monotonic=lambda: next(clock), sleep=slept.append,
         )
         self.assertEqual(slept, [0.0])
@@ -1283,7 +1283,7 @@ class TestDriveDisplay(unittest.TestCase):
         def next_frame(now):
             raise KeyboardInterrupt
 
-        sm.drive_display(RecordingDisplay(), next_frame, fps=20.0, once=False)
+        sm.drive_display(RecordingDisplay(), next_frame, fps=20.0, max_frames=None)
 
     def test_passes_the_frame_start_time_to_the_source(self):
         seen: list[float] = []
@@ -1291,7 +1291,7 @@ class TestDriveDisplay(unittest.TestCase):
             RecordingDisplay(),
             lambda now: (seen.append(now), art_image())[1],
             fps=20.0,
-            once=True,
+            max_frames=1,
             monotonic=lambda: 42.5,
         )
         self.assertEqual(seen, [42.5])
@@ -1662,6 +1662,527 @@ class TestRunStartup(unittest.TestCase):
         with mock.patch.object(sm, "build_provider", side_effect=AssertionError("no provider")):
             sm.run(args)
         self.assertEqual(len(list(directory.iterdir())), 4)
+
+
+# ======================================================================================
+# Display styles
+# ======================================================================================
+
+
+class TestAlbumArtRenderer(unittest.TestCase):
+    SIZE = 64
+
+    def setUp(self):
+        self.renderer = sm.AlbumArtRenderer(self.SIZE)
+
+    def test_is_not_animated(self):
+        self.assertFalse(self.renderer.animated)
+
+    def test_fit_fills_the_whole_panel_not_just_the_disc(self):
+        self.assertEqual(self.renderer.fit(art_image()).size, (self.SIZE, self.SIZE))
+
+    def test_art_reaches_the_edges(self):
+        frame = self.renderer.render(self.renderer.fit(art_image((255, 0, 0))), 0.0)
+        for corner in ((0, 0), (63, 0), (0, 63), (63, 63)):
+            with self.subTest(corner=corner):
+                self.assertEqual(frame.getpixel(corner), (255, 0, 0))
+
+    def test_no_disc_furniture_is_drawn(self):
+        # Flat art must come out flat: no ring, no centre label, no spindle hole.
+        frame = self.renderer.render(self.renderer.fit(art_image((255, 0, 0))), 0.0)
+        self.assertEqual(frame.getextrema(), ((255, 255), (0, 0), (0, 0)))
+
+    def test_angle_is_ignored(self):
+        fitted = self.renderer.fit(sm.demo_album_art(256))
+        self.assertEqual(
+            self.renderer.render(fitted, 0.0).tobytes(),
+            self.renderer.render(fitted, 137.0).tobytes(),
+        )
+
+    def test_render_is_a_no_op_for_already_fitted_art(self):
+        fitted = self.renderer.fit(art_image())
+        self.assertIs(self.renderer.render(fitted, 0.0), fitted)
+
+    def test_tolerates_unfitted_art(self):
+        frame = self.renderer.render(art_image((3, 4, 5), (640, 640)), 0.0)
+        self.assertEqual(frame.size, (self.SIZE, self.SIZE))
+        self.assertEqual(frame.mode, "RGB")
+
+    def test_idle_is_stable_and_shared(self):
+        self.assertIs(self.renderer.idle(), self.renderer.idle())
+
+
+class TestRendererStyles(unittest.TestCase):
+    def test_both_styles_are_registered(self):
+        self.assertEqual(set(sm.RENDERER_STYLES), {"record", "art"})
+
+    def test_build_renderer_picks_the_right_class(self):
+        self.assertIsInstance(sm.build_renderer("record", 64), sm.RecordRenderer)
+        self.assertIsInstance(sm.build_renderer("art", 64), sm.AlbumArtRenderer)
+
+    def test_every_style_satisfies_the_frame_renderer_protocol(self):
+        for style in sm.RENDERER_STYLES:
+            with self.subTest(style=style):
+                renderer = sm.build_renderer(style, 64)
+                fitted = renderer.fit(art_image())
+                frame = renderer.render(fitted, 12.0)
+                self.assertEqual(frame.size, (64, 64))
+                self.assertEqual(frame.mode, "RGB")
+                self.assertEqual(renderer.idle().size, (64, 64))
+                self.assertIsInstance(renderer.animated, bool)
+
+    def test_cli_choices_match_the_style_table(self):
+        action = next(a for a in sm.build_parser()._actions if a.dest == "style")
+        self.assertEqual(set(action.choices), set(sm.RENDERER_STYLES))
+        self.assertEqual(sm.build_parser().parse_args([]).style, "record")
+
+    def test_static_style_does_not_advance_the_angle(self):
+        renderer = sm.build_renderer("art", 64)
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("k", "u", True), renderer.fit(art_image()))
+        source = sm.RecordFrameSource(renderer, state, 20.0, start_time=0.0)
+        source(1.0)
+        source(2.0)
+        self.assertEqual(source.angle, 0.0, "no point spinning art that is not a disc")
+
+    def test_record_style_does_advance_the_angle(self):
+        renderer = sm.build_renderer("record", 64)
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("k", "u", True), renderer.fit(art_image()))
+        source = sm.RecordFrameSource(renderer, state, 20.0, start_time=0.0)
+        source(1.0)
+        self.assertNotEqual(source.angle, 0.0)
+
+
+class TestRenderPreviewFramesStyles(unittest.TestCase):
+    def test_record_style_writes_four_angles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "p"
+            sm.render_preview_frames(out, style="record")
+            self.assertEqual(len(list(out.iterdir())), 4)
+
+    def test_static_style_writes_one_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "p"
+            sm.render_preview_frames(out, style="art")
+            self.assertEqual([f.name for f in out.iterdir()], ["album-disk-00.png"])
+
+    def test_scale_is_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "p"
+            sm.render_preview_frames(out, style="art", scale=5)
+            with Image.open(out / "album-disk-00.png") as image:
+                self.assertEqual(image.size, (320, 320))
+
+
+# ======================================================================================
+# Preview backends
+# ======================================================================================
+
+
+class TestScaleForPreview(unittest.TestCase):
+    def test_scale_of_one_is_a_no_op(self):
+        image = art_image(size=(8, 8))
+        self.assertIs(sm.scale_for_preview(image, 1), image)
+
+    def test_magnifies_by_the_given_factor(self):
+        self.assertEqual(sm.scale_for_preview(art_image(size=(8, 8)), 4).size, (32, 32))
+
+    def test_uses_nearest_neighbour_so_pixels_stay_crisp(self):
+        source = Image.new("RGB", (2, 1), (255, 0, 0))
+        source.putpixel((1, 0), (0, 0, 255))
+        scaled = sm.scale_for_preview(source, 8)
+        # A smoothing filter would blend across the boundary; nearest must not.
+        self.assertEqual(scaled.getpixel((3, 4)), (255, 0, 0))
+        self.assertEqual(scaled.getpixel((12, 4)), (0, 0, 255))
+        self.assertEqual({scaled.getpixel((x, 0)) for x in range(16)}, {(255, 0, 0), (0, 0, 255)})
+
+    def test_grid_draws_the_inter_pixel_gutter(self):
+        flat = sm.scale_for_preview(art_image((255, 255, 255), (4, 4)), 8, grid=False)
+        gridded = sm.scale_for_preview(art_image((255, 255, 255), (4, 4)), 8, grid=True)
+        self.assertEqual(flat.getpixel((8, 4)), (255, 255, 255), "no gutter without --preview-grid")
+        self.assertEqual(gridded.getpixel((8, 4)), (0, 0, 0), "gutter at each pixel boundary")
+        self.assertEqual(gridded.getpixel((4, 4)), (255, 255, 255), "pixel centre untouched")
+
+    def test_grid_is_skipped_when_there_is_no_room_for_it(self):
+        # At scale 2 a gutter would consume half of every pixel.
+        with_grid = sm.scale_for_preview(art_image((255, 255, 255), (4, 4)), 2, grid=True)
+        self.assertEqual(with_grid.getpixel((2, 2)), (255, 255, 255))
+
+
+class TestTerminalDisplay(unittest.TestCase):
+    def test_two_pixel_rows_per_character_row(self):
+        text = sm.TerminalDisplay.frame_to_text(art_image(size=(64, 64)))
+        self.assertEqual(len(text.split("\n")), 32)
+
+    def test_one_cell_per_pixel_column(self):
+        text = sm.TerminalDisplay.frame_to_text(art_image(size=(64, 64)))
+        self.assertEqual(text.split("\n")[0].count(sm.TerminalDisplay.HALF_BLOCK), 64)
+
+    def test_encodes_the_top_pixel_as_foreground_and_bottom_as_background(self):
+        image = Image.new("RGB", (1, 2))
+        image.putpixel((0, 0), (10, 20, 30))
+        image.putpixel((0, 1), (40, 50, 60))
+        text = sm.TerminalDisplay.frame_to_text(image)
+        self.assertIn("38;2;10;20;30", text)
+        self.assertIn("48;2;40;50;60", text)
+
+    def test_repeated_colours_do_not_repeat_the_escape_code(self):
+        """A 64x64 frame is 2048 cells; re-emitting SGR per cell would be needlessly fat."""
+        flat = sm.TerminalDisplay.frame_to_text(art_image((5, 5, 5), (64, 64)))
+        self.assertEqual(flat.count("\x1b[38;2;"), 32, "one colour change per row at most")
+
+    def test_odd_height_does_not_crash_or_drop_a_row(self):
+        text = sm.TerminalDisplay.frame_to_text(art_image(size=(4, 5)))
+        self.assertEqual(len(text.split("\n")), 3)
+
+    def test_accepts_non_rgb_frames(self):
+        sm.TerminalDisplay.frame_to_text(Image.new("RGBA", (4, 4), (1, 2, 3, 255)))
+
+    def test_show_homes_the_cursor_instead_of_scrolling(self):
+        stream = io.StringIO()
+        display = sm.TerminalDisplay(stream=stream)
+        display.show(art_image(size=(4, 4)))
+        first = stream.getvalue()
+        display.show(art_image(size=(4, 4)))
+        second = stream.getvalue()[len(first):]
+        self.assertIn("\x1b[2J", first, "clears the screen once on the first frame")
+        self.assertIn("\x1b[?25l", first, "hides the cursor")
+        self.assertNotIn("\x1b[2J", second, "later frames overwrite in place")
+        self.assertTrue(second.startswith("\x1b[H"))
+
+    def test_clear_restores_the_cursor(self):
+        stream = io.StringIO()
+        display = sm.TerminalDisplay(stream=stream)
+        display.show(art_image(size=(4, 4)))
+        display.clear()
+        self.assertIn("\x1b[?25h", stream.getvalue())
+
+    def test_clear_is_a_no_op_before_any_frame(self):
+        stream = io.StringIO()
+        sm.TerminalDisplay(stream=stream).clear()
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_context_manager_restores_the_cursor_on_exit(self):
+        stream = io.StringIO()
+        with sm.TerminalDisplay(stream=stream) as display:
+            display.show(art_image(size=(4, 4)))
+        self.assertIn("\x1b[?25h", stream.getvalue())
+
+
+class TestGifRecorderDisplay(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.output = Path(self.tmp.name) / "out" / "spin.gif"
+
+    def frames_of(self, path):
+        with Image.open(path) as gif:
+            return [frame.copy().convert("RGB") for frame in ImageSequence.Iterator(gif)]
+
+    def test_nothing_is_written_before_exit(self):
+        display = sm.GifRecorderDisplay(self.output, fps=10.0)
+        display.show(art_image(size=(8, 8)))
+        self.assertFalse(self.output.exists())
+
+    def test_writes_an_animated_gif_on_exit(self):
+        with quiet():
+            with sm.GifRecorderDisplay(self.output, fps=10.0) as display:
+                for colour in ((255, 0, 0), (0, 255, 0), (0, 0, 255)):
+                    display.show(art_image(colour, (8, 8)))
+        frames = self.frames_of(self.output)
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(len({f.tobytes() for f in frames}), 3)
+
+    def test_no_file_when_no_frames_were_shown(self):
+        with quiet():
+            with sm.GifRecorderDisplay(self.output, fps=10.0):
+                pass
+        self.assertFalse(self.output.exists())
+
+    def test_frame_delay_follows_fps(self):
+        with quiet():
+            with sm.GifRecorderDisplay(self.output, fps=10.0) as display:
+                display.show(art_image(size=(8, 8)))
+                display.show(art_image((9, 9, 9), (8, 8)))
+        with Image.open(self.output) as gif:
+            self.assertEqual(gif.info["duration"], 100)
+
+    def test_frame_delay_is_clamped_to_what_gif_can_represent(self):
+        with quiet():
+            with sm.GifRecorderDisplay(self.output, fps=200.0) as display:
+                display.show(art_image(size=(8, 8)))
+                display.show(art_image((9, 9, 9), (8, 8)))
+        with Image.open(self.output) as gif:
+            self.assertGreaterEqual(gif.info["duration"], 20)
+
+    def test_scale_is_applied_to_the_recording(self):
+        with quiet():
+            with sm.GifRecorderDisplay(self.output, fps=10.0, scale=4) as display:
+                display.show(art_image(size=(8, 8)))
+        self.assertEqual(self.frames_of(self.output)[0].size, (32, 32))
+
+    def test_copies_frames_so_a_reused_buffer_is_not_captured_twice(self):
+        """AlbumArtRenderer returns the same object every frame; the recorder must copy."""
+        shared = art_image((1, 1, 1), (8, 8))
+        with quiet():
+            with sm.GifRecorderDisplay(self.output, fps=10.0) as display:
+                display.show(shared)
+                shared.paste((255, 255, 255), (0, 0, 8, 8))
+                display.show(shared)
+        frames = self.frames_of(self.output)
+        self.assertEqual(len({f.tobytes() for f in frames}), 2)
+
+    def test_creates_the_parent_directory(self):
+        sm.GifRecorderDisplay(self.output, fps=10.0)
+        self.assertTrue(self.output.parent.is_dir())
+
+
+class TestBuildDisplayBackends(unittest.TestCase):
+    def parse(self, argv):
+        return sm.build_parser().parse_args(argv)
+
+    def test_mock_output_selects_the_png_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            display = sm.build_display(self.parse(["--mock-output", str(Path(tmp) / "f.png")]))
+        self.assertIsInstance(display, sm.MockDisplay)
+
+    def test_preview_terminal_selects_the_terminal_backend(self):
+        self.assertIsInstance(sm.build_display(self.parse(["--preview-terminal"])), sm.TerminalDisplay)
+
+    def test_record_gif_selects_the_recorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            display = sm.build_display(self.parse(["--record-gif", str(Path(tmp) / "a.gif")]))
+        self.assertIsInstance(display, sm.GifRecorderDisplay)
+
+    def test_scale_and_grid_reach_the_png_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            display = sm.build_display(self.parse([
+                "--mock-output", str(Path(tmp) / "f.png"), "--preview-scale", "6", "--preview-grid",
+            ]))
+        self.assertEqual((display.scale, display.grid), (6, True))
+
+    def test_backends_are_mutually_exclusive(self):
+        pairs = [
+            ["--mock-output", "/tmp/a.png", "--preview-terminal"],
+            ["--preview-terminal", "--record-gif", "/tmp/a.gif"],
+            ["--mock-output", "/tmp/a.png", "--record-gif", "/tmp/a.gif"],
+        ]
+        for argv in pairs:
+            with self.subTest(argv=argv):
+                with self.assertRaises(SystemExit), quiet():
+                    self.parse(argv)
+
+    def test_mock_display_scale_reaches_the_written_png(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "f.png"
+            sm.MockDisplay(output, scale=3).show(art_image(size=(8, 8)))
+            with Image.open(output) as written:
+                self.assertEqual(written.size, (24, 24))
+
+
+# ======================================================================================
+# Demo provider
+# ======================================================================================
+
+
+class TestDemoProvider(unittest.TestCase):
+    def build(self, cycle_seconds=6.0):
+        clock = FakeClock()
+        return sm.DemoProvider(cycle_seconds=cycle_seconds, clock=clock), clock
+
+    def test_needs_no_authorization(self):
+        provider, _ = self.build()
+        self.assertIsNone(provider.authorize())
+
+    def test_starts_playing(self):
+        provider, _ = self.build()
+        art = provider.get_playback_art()
+        self.assertTrue(art.is_playing)
+        self.assertEqual(art.image_url, sm.DemoProvider.DEMO_IMAGE_URL)
+
+    def test_cycles_playing_then_paused_then_idle(self):
+        provider, clock = self.build(cycle_seconds=6.0)
+        observed = []
+        for _ in range(3):
+            art = provider.get_playback_art()
+            observed.append(None if art is None else art.is_playing)
+            clock.advance(6.0)
+        self.assertEqual(observed, [True, False, None])
+
+    def test_cycle_repeats(self):
+        provider, clock = self.build(cycle_seconds=6.0)
+        clock.advance(18.0)
+        self.assertTrue(provider.get_playback_art().is_playing)
+
+    def test_paused_state_keeps_the_same_track(self):
+        provider, clock = self.build(cycle_seconds=6.0)
+        first = provider.get_playback_art()
+        clock.advance(6.0)
+        second = provider.get_playback_art()
+        self.assertEqual(first.key, second.key)
+        self.assertFalse(second.is_playing)
+
+    def test_is_registered_as_a_provider_needing_no_env(self):
+        self.assertIn("demo", sm.PROVIDERS)
+        self.assertEqual(sm.PROVIDERS["demo"].required_env, ())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            provider = sm.build_provider(sm.build_parser().parse_args(["--provider", "demo"]))
+        self.assertIsInstance(provider, sm.DemoProvider)
+
+    def test_cycle_length_comes_from_the_cli(self):
+        args = sm.build_parser().parse_args(["--provider", "demo", "--demo-cycle-seconds", "2"])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(sm.build_provider(args).cycle_seconds, 2.0)
+
+
+class TestBuildImagePreparer(unittest.TestCase):
+    def test_demo_provider_never_downloads(self):
+        args = sm.build_parser().parse_args(["--provider", "demo"])
+        renderer = sm.build_renderer("record", 64)
+        with mock.patch.object(sm, "download_image", side_effect=AssertionError("no network")):
+            image = sm.build_image_preparer(args, renderer)(sm.DemoProvider.DEMO_IMAGE_URL)
+        self.assertEqual(image.size, (renderer.disc_size,) * 2)
+
+    def test_real_provider_downloads_and_fits(self):
+        args = sm.build_parser().parse_args([])
+        renderer = sm.build_renderer("record", 64)
+        with mock.patch.object(sm, "download_image", return_value=art_image(size=(640, 640))) as dl:
+            image = sm.build_image_preparer(args, renderer)("https://art/a.png")
+        dl.assert_called_once_with("https://art/a.png")
+        self.assertEqual(image.size, (renderer.disc_size,) * 2)
+
+    def test_fits_to_the_active_style(self):
+        args = sm.build_parser().parse_args(["--provider", "demo"])
+        art_renderer = sm.build_renderer("art", 64)
+        image = sm.build_image_preparer(args, art_renderer)("x")
+        self.assertEqual(image.size, (64, 64), "static art fills the panel, not just the disc")
+
+
+# ======================================================================================
+# Frame budget and preview end-to-end
+# ======================================================================================
+
+
+class TestFrameBudget(unittest.TestCase):
+    def parse(self, argv):
+        return sm.build_parser().parse_args(argv)
+
+    def test_live_run_is_unbounded(self):
+        self.assertIsNone(sm.frame_budget(self.parse([])))
+
+    def test_once_is_a_single_frame(self):
+        self.assertEqual(sm.frame_budget(self.parse(["--once"])), 1)
+
+    def test_gif_length_is_fps_times_seconds(self):
+        args = self.parse(["--record-gif", "/tmp/a.gif", "--fps", "10", "--record-seconds", "3"])
+        self.assertEqual(sm.frame_budget(args), 30)
+
+    def test_gif_records_at_least_one_frame(self):
+        args = self.parse(["--record-gif", "/tmp/a.gif", "--fps", "1", "--record-seconds", "0.1"])
+        self.assertEqual(sm.frame_budget(args), 1)
+
+    def test_once_wins_over_gif_length(self):
+        args = self.parse(["--record-gif", "/tmp/a.gif", "--once"])
+        self.assertEqual(sm.frame_budget(args), 1)
+
+
+class TestDriveDisplayFrameBudget(unittest.TestCase):
+    def test_stops_after_max_frames(self):
+        display = RecordingDisplay()
+        sm.drive_display(
+            display, lambda now: art_image(), fps=1000.0, max_frames=7, sleep=lambda s: None
+        )
+        self.assertEqual(len(display.frames), 7)
+
+    def test_no_trailing_sleep_after_the_last_frame(self):
+        slept = []
+        sm.drive_display(
+            RecordingDisplay(), lambda now: art_image(), fps=10.0, max_frames=3,
+            monotonic=lambda: 0.0, sleep=slept.append,
+        )
+        self.assertEqual(len(slept), 2, "sleeps between frames, not after the last one")
+
+
+class TestPlaybackStateFirstUpdate(unittest.TestCase):
+    def test_not_set_before_the_first_poll(self):
+        self.assertFalse(sm.PlaybackState().wait_for_first_update(timeout=0.01))
+
+    def test_set_by_update(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("k", "u", True), art_image())
+        self.assertTrue(state.wait_for_first_update(timeout=0.01))
+
+    def test_set_by_clear_so_an_idle_provider_does_not_stall_a_preview(self):
+        state = sm.PlaybackState()
+        state.clear()
+        self.assertTrue(state.wait_for_first_update(timeout=0.01))
+
+
+class TestPreviewEndToEnd(unittest.TestCase):
+    """The whole point: see what the panel would show, with no panel."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def run_cli(self, argv):
+        with quiet():
+            sm.run(sm.build_parser().parse_args(argv))
+
+    def test_demo_provider_renders_real_art_not_the_idle_frame(self):
+        output = self.dir / "f.png"
+        self.run_cli(["--provider", "demo", "--mock-output", str(output), "--once"])
+        with Image.open(output) as frame:
+            colours = {frame.convert("RGB").getpixel((16, 32))}
+        self.assertNotEqual(colours, {(0, 0, 0)}, "the poll should land before the frame")
+
+    def test_static_style_fills_the_panel_end_to_end(self):
+        output = self.dir / "art.png"
+        self.run_cli(["--provider", "demo", "--style", "art", "--mock-output", str(output), "--once"])
+        with Image.open(output) as frame:
+            self.assertNotEqual(frame.convert("RGB").getpixel((0, 0)), (0, 0, 0))
+
+    def test_record_style_leaves_the_corners_black_end_to_end(self):
+        output = self.dir / "rec.png"
+        self.run_cli(["--provider", "demo", "--style", "record", "--mock-output", str(output), "--once"])
+        with Image.open(output) as frame:
+            self.assertEqual(frame.convert("RGB").getpixel((0, 0)), (0, 0, 0))
+
+    def test_gif_recording_captures_the_spin(self):
+        output = self.dir / "spin.gif"
+        self.run_cli([
+            "--provider", "demo", "--record-gif", str(output), "--record-seconds", "1", "--fps", "8",
+        ])
+        with Image.open(output) as gif:
+            frames = [f.copy().convert("RGB").tobytes() for f in ImageSequence.Iterator(gif)]
+        self.assertGreaterEqual(len(frames), 2)
+        self.assertGreater(len(set(frames)), 1, "a spinning record should differ frame to frame")
+
+    def test_terminal_preview_writes_a_frame_without_hardware(self):
+        stream = io.StringIO()
+        args = sm.build_parser().parse_args(["--provider", "demo", "--preview-terminal", "--once"])
+        real = sm.TerminalDisplay  # capture before patching, or the lambda recurses
+        with mock.patch.object(sm, "TerminalDisplay", lambda: real(stream=stream)), quiet():
+            sm.run(args)
+        self.assertIn(sm.TerminalDisplay.HALF_BLOCK, stream.getvalue())
+        self.assertIn("\x1b[38;2;", stream.getvalue())
+
+    def test_scaled_grid_preview_is_written_at_the_requested_size(self):
+        output = self.dir / "big.png"
+        self.run_cli([
+            "--provider", "demo", "--mock-output", str(output),
+            "--preview-scale", "8", "--preview-grid", "--once",
+        ])
+        with Image.open(output) as frame:
+            self.assertEqual(frame.size, (512, 512))
+
+    def test_demo_needs_no_credentials(self):
+        output = self.dir / "f.png"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.run_cli(["--provider", "demo", "--mock-output", str(output), "--once"])
+        self.assertTrue(output.exists())
 
 
 if __name__ == "__main__":
