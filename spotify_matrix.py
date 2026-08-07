@@ -82,6 +82,9 @@ class PlaybackArt:
     key: str
     image_url: str
     is_playing: bool
+    # Human-readable "Artist - Track", for the terminal preview's status line. The key is
+    # whatever the provider considers stable (often an opaque id), which is useless to read.
+    title: str | None = None
 
 
 @dataclass
@@ -472,6 +475,12 @@ class YouTubeMusicClient:
 
         track_key = str(entry.get("videoId") or entry.get("title") or image_url)
 
+        name = entry.get("title") or ""
+        artists = ", ".join(
+            artist.get("name", "") for artist in (entry.get("artists") or []) if artist.get("name")
+        )
+        title = f"{artists} - {name}".strip(" -") if artists else name
+
         now = self._clock()
         if track_key != self._last_key or self._last_change_at is None:
             self._last_key = track_key
@@ -481,6 +490,7 @@ class YouTubeMusicClient:
             key=track_key,
             image_url=str(image_url),
             is_playing=(now - self._last_change_at) <= self.stale_after_seconds,
+            title=title or None,
         )
 
 
@@ -512,6 +522,7 @@ class DemoProvider:
             key="demo-track",
             image_url=self.DEMO_IMAGE_URL,
             is_playing=phase == 0,
+            title="Demo Artist - Demo Track",
         )
 
 
@@ -546,12 +557,29 @@ class LastFmClient:
         self.api_key = api_key
         self.user = user
         self._http = http
+        self.account_summary: str | None = None
 
     def authorize(self) -> None:
         # Verify the API key and username by issuing a recent-tracks request.
-        self.get_playback_art()
+        self._fetch_recent_tracks()
 
-    def get_playback_art(self) -> PlaybackArt | None:
+    def _fetch_recent_tracks(self) -> dict[str, Any]:
+        """Return the `recenttracks` object, recording which account answered.
+
+        Last.fm only errors on a username that does not exist, so any real account
+        verifies. Remembering who answered is what lets --auth-only show you whether it
+        was *your* account -- a typo'd but valid username otherwise looks like success.
+        """
+        recent = self._request_recent_tracks()
+        attributes = recent.get("@attr") or {}
+        resolved_user = attributes.get("user")
+        total = attributes.get("total")
+        if resolved_user:
+            scrobbles = f"{int(total):,} scrobbles" if str(total).isdigit() else "unknown scrobbles"
+            self.account_summary = f"user {resolved_user}, {scrobbles}"
+        return recent
+
+    def _request_recent_tracks(self) -> dict[str, Any]:
         response = self._http(
             "GET",
             LASTFM_API_URL,
@@ -572,8 +600,12 @@ class LastFmClient:
 
         payload = response.json()
         self._raise_for_payload_error(payload)
+        return payload.get("recenttracks") or {}
 
-        tracks = (payload.get("recenttracks") or {}).get("track") or []
+    def get_playback_art(self) -> PlaybackArt | None:
+        recent = self._fetch_recent_tracks()
+
+        tracks = recent.get("track") or []
         if isinstance(tracks, dict):
             tracks = [tracks]
         if not tracks:
@@ -591,11 +623,13 @@ class LastFmClient:
             return None
 
         artist = (track.get("artist") or {}).get("#text", "")
-        track_key = track.get("mbid") or f"{artist} - {track.get('name', '')}".strip(" -")
+        title = f"{artist} - {track.get('name', '')}".strip(" -")
+        track_key = track.get("mbid") or title
         return PlaybackArt(
             key=str(track_key) or image_url,
             image_url=image_url,
             is_playing=True,
+            title=title or None,
         )
 
     def _raise_for_payload_error(self, payload: dict[str, Any]) -> None:
@@ -1092,10 +1126,18 @@ def playback_art_from_response(playback: dict[str, Any] | None) -> PlaybackArt |
 
     image = max(images, key=lambda candidate: candidate.get("width") or 0)
     item_id = item.get("id") or item.get("uri") or image["url"]
+
+    name = item.get("name") or ""
+    artists = ", ".join(
+        artist.get("name", "") for artist in (item.get("artists") or []) if artist.get("name")
+    )
+    title = f"{artists} - {name}".strip(" -") if artists else name
+
     return PlaybackArt(
         key=str(item_id),
         image_url=image["url"],
         is_playing=bool(playback.get("is_playing")),
+        title=title or None,
     )
 
 
@@ -1316,6 +1358,7 @@ class PlaybackState:
         self._image_url = image_url
         self._image = image
         self._is_playing = is_playing
+        self._title: str | None = None
         # Set the first time the poll thread reports anything at all, success or idle.
         self._first_update = threading.Event()
 
@@ -1339,6 +1382,11 @@ class PlaybackState:
         with self._lock:
             return self._is_playing
 
+    @property
+    def title(self) -> str | None:
+        with self._lock:
+            return self._title
+
     def snapshot(self) -> tuple[Image.Image | None, bool]:
         """Read the art and playing flag together, so a frame never mixes two updates."""
         with self._lock:
@@ -1357,6 +1405,7 @@ class PlaybackState:
             self._art_key = art.key
             self._image_url = art.image_url
             self._is_playing = art.is_playing
+            self._title = art.title
             if image is not None:
                 self._image = image
         self._first_update.set()
@@ -1367,6 +1416,7 @@ class PlaybackState:
             self._image_url = None
             self._image = None
             self._is_playing = False
+            self._title = None
         self._first_update.set()
 
 
@@ -1518,35 +1568,45 @@ def _build_demo(args: argparse.Namespace, env: dict[str, str]) -> PlaybackProvid
     return DemoProvider(cycle_seconds=args.demo_cycle_seconds)
 
 
+def _lastfm_verified_message(args: argparse.Namespace, provider: Any) -> str:
+    # Name the account that answered. Last.fm only rejects usernames that do not exist, so
+    # a typo that happens to be somebody else's account verifies happily and then shows
+    # their listening instead of yours.
+    summary = getattr(provider, "account_summary", None)
+    if summary:
+        return f"Last.fm verified: {summary}. Check that is your account."
+    return "Last.fm API key and user verified."
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     required_env: tuple[str, ...]
     factory: Callable[[argparse.Namespace, dict[str, str]], PlaybackProvider]
-    verified_message: Callable[[argparse.Namespace], str]
+    verified_message: Callable[[argparse.Namespace, Any], str]
 
 
 PROVIDERS: dict[str, ProviderSpec] = {
     "spotify": ProviderSpec(
         required_env=("SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"),
         factory=_build_spotify,
-        verified_message=lambda args: f"Spotify token cached at {args.token_cache}",
+        verified_message=lambda args, provider: f"Spotify token cached at {args.token_cache}",
     ),
     "youtube-music": ProviderSpec(
         required_env=(),
         factory=_build_ytmusic,
-        verified_message=lambda args: (
+        verified_message=lambda args, provider: (
             f"YouTube Music auth headers verified at {args.ytmusic_auth_headers}"
         ),
     ),
     "lastfm": ProviderSpec(
         required_env=("LASTFM_API_KEY", "LASTFM_USER"),
         factory=_build_lastfm,
-        verified_message=lambda args: "Last.fm API key and user verified.",
+        verified_message=_lastfm_verified_message,
     ),
     "demo": ProviderSpec(
         required_env=(),
         factory=_build_demo,
-        verified_message=lambda args: "Demo provider needs no credentials.",
+        verified_message=lambda args, provider: "Demo provider needs no credentials.",
     ),
 }
 
@@ -1594,7 +1654,9 @@ def playback_status(provider_name: str, style: str, state: PlaybackState) -> str
         playback = "playing" if is_playing else "paused"
 
     parts = [provider_name, style, playback]
-    track = state.art_key
+    # Prefer the human-readable title; the key is often an opaque id (Last.fm mbid,
+    # Spotify track id) which tells you nothing about whether the right thing is playing.
+    track = state.title or state.art_key
     if track:
         parts.append(track if len(track) <= 40 else track[:39] + "…")
     return " · ".join(parts)
@@ -1651,7 +1713,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
     if args.auth_only:
-        print(PROVIDERS[args.provider].verified_message(args))
+        print(PROVIDERS[args.provider].verified_message(args, provider))
         return
 
     renderer = build_renderer(args.style, size)

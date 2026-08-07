@@ -489,7 +489,12 @@ class TestLastFmClient(unittest.TestCase):
         client = self.client(lastfm_payload([{"size": "extralarge", "#text": "xl.png"}], mbid="mb-1"))
         self.assertEqual(
             client.get_playback_art(),
-            sm.PlaybackArt(key="mb-1", image_url="xl.png", is_playing=True),
+            sm.PlaybackArt(
+                key="mb-1",
+                image_url="xl.png",
+                is_playing=True,
+                title="Massive Attack - Teardrop",
+            ),
         )
 
     def test_key_falls_back_to_artist_and_title(self):
@@ -578,6 +583,91 @@ class TestLastFmClient(unittest.TestCase):
         client.get_playback_art()
         self.assertEqual(self.http.calls[0]["url"], sm.LASTFM_API_URL)
         self.assertEqual(self.http.calls[0]["params"]["user"], "user")
+
+    def test_title_is_artist_and_track(self):
+        client = self.client(
+            lastfm_payload([{"size": "large", "#text": "l.png"}], mbid="mb", artist="Robyn", name="Dancing On My Own")
+        )
+        self.assertEqual(client.get_playback_art().title, "Robyn - Dancing On My Own")
+
+    def test_title_is_none_when_the_track_is_unnamed(self):
+        payload = {
+            "recenttracks": {
+                "track": [{
+                    "@attr": {"nowplaying": "true"},
+                    "image": [{"size": "large", "#text": "l.png"}],
+                }]
+            }
+        }
+        self.assertIsNone(self.client(payload).get_playback_art().title)
+
+
+class TestLastFmAccountIdentification(unittest.TestCase):
+    """A typo'd username that happens to exist verifies fine and shows someone else's music."""
+
+    def payload(self, user="pam-o", total="257480"):
+        return {
+            "recenttracks": {
+                "@attr": {"user": user, "total": total, "page": "1", "perPage": "1"},
+                "track": [],
+            }
+        }
+
+    def client(self, payload):
+        return sm.LastFmClient("key", "requested-name", http=fake_http(http_response(payload)))
+
+    def test_authorize_records_which_account_answered(self):
+        client = self.client(self.payload())
+        client.authorize()
+        self.assertEqual(client.account_summary, "user pam-o, 257,480 scrobbles")
+
+    def test_summary_names_the_resolved_user_not_the_requested_one(self):
+        client = self.client(self.payload(user="someone-else"))
+        client.authorize()
+        self.assertIn("someone-else", client.account_summary)
+        self.assertNotIn("requested-name", client.account_summary)
+
+    def test_scrobble_count_is_thousands_separated(self):
+        client = self.client(self.payload(total="1234567"))
+        client.authorize()
+        self.assertIn("1,234,567 scrobbles", client.account_summary)
+
+    def test_non_numeric_total_does_not_crash(self):
+        client = self.client(self.payload(total="lots"))
+        client.authorize()
+        self.assertIn("unknown scrobbles", client.account_summary)
+
+    def test_missing_attr_block_leaves_no_summary(self):
+        client = self.client({"recenttracks": {"track": []}})
+        client.authorize()
+        self.assertIsNone(client.account_summary)
+
+    def test_summary_is_also_recorded_by_a_normal_poll(self):
+        client = self.client(self.payload())
+        client.get_playback_art()
+        self.assertEqual(client.account_summary, "user pam-o, 257,480 scrobbles")
+
+    def test_verified_message_shows_the_account(self):
+        client = self.client(self.payload())
+        client.authorize()
+        message = sm.PROVIDERS["lastfm"].verified_message(sm.build_parser().parse_args([]), client)
+        self.assertIn("pam-o", message)
+        self.assertIn("257,480", message)
+        self.assertIn("your account", message)
+
+    def test_verified_message_falls_back_when_the_account_is_unknown(self):
+        client = self.client({"recenttracks": {"track": []}})
+        client.authorize()
+        message = sm.PROVIDERS["lastfm"].verified_message(sm.build_parser().parse_args([]), client)
+        self.assertIn("verified", message)
+
+    def test_bad_key_still_raises_before_any_summary_is_recorded(self):
+        client = sm.LastFmClient(
+            "key", "user", http=fake_http(http_response({"error": 10, "message": "Invalid API key"}))
+        )
+        with self.assertRaises(sm.ProviderAuthError):
+            client.authorize()
+        self.assertIsNone(client.account_summary)
 
 
 # ======================================================================================
@@ -695,6 +785,17 @@ class TestYouTubeMusicClient(unittest.TestCase):
         client._client.history = [self.entry(video_id="second")]
         self.assertTrue(client.get_playback_art().is_playing, "a new track should spin again")
 
+    def test_title_combines_artists_and_track_name(self):
+        entry = self.entry()
+        entry["artists"] = [{"name": "Robyn"}]
+        entry["title"] = "Honey"
+        client, _ = self.build([entry])
+        self.assertEqual(client.get_playback_art().title, "Robyn - Honey")
+
+    def test_title_falls_back_to_the_bare_name_without_artists(self):
+        client, _ = self.build([self.entry(title="Just A Title")])
+        self.assertEqual(client.get_playback_art().title, "Just A Title")
+
     def test_missing_auth_file_is_a_fatal_auth_error(self):
         client = sm.YouTubeMusicClient(auth_headers_path=Path("/nonexistent/auth.json"))
         with self.assertRaises(sm.ProviderAuthError) as ctx:
@@ -736,6 +837,43 @@ class TestPlaybackArtFromResponse(unittest.TestCase):
         self.assertIsNone(
             sm.playback_art_from_response({"item": {"type": "track", "id": "t", "album": {"images": []}}})
         )
+
+    def test_title_combines_artists_and_track_name(self):
+        art = sm.playback_art_from_response({
+            "is_playing": True,
+            "item": {
+                "type": "track",
+                "id": "t1",
+                "name": "Dancing On My Own",
+                "artists": [{"name": "Robyn"}],
+                "album": {"images": [{"url": "a.png", "width": 640}]},
+            },
+        })
+        self.assertEqual(art.title, "Robyn - Dancing On My Own")
+
+    def test_title_joins_multiple_artists(self):
+        art = sm.playback_art_from_response({
+            "item": {
+                "type": "track",
+                "id": "t1",
+                "name": "Song",
+                "artists": [{"name": "A"}, {"name": "B"}],
+                "album": {"images": [{"url": "a.png", "width": 1}]},
+            },
+        })
+        self.assertEqual(art.title, "A, B - Song")
+
+    def test_episode_title_is_just_the_name(self):
+        art = sm.playback_art_from_response({
+            "item": {"type": "episode", "id": "e1", "name": "Ep 12", "images": [{"url": "e.png", "width": 1}]},
+        })
+        self.assertEqual(art.title, "Ep 12")
+
+    def test_title_is_none_when_unnamed(self):
+        art = sm.playback_art_from_response({
+            "item": {"type": "track", "id": "t", "album": {"images": [{"url": "a.png", "width": 1}]}},
+        })
+        self.assertIsNone(art.title)
 
     def test_key_falls_back_to_uri(self):
         art = sm.playback_art_from_response({
@@ -1484,7 +1622,7 @@ class TestProviderTable(unittest.TestCase):
         args = self.parse([])
         for name, spec in sm.PROVIDERS.items():
             with self.subTest(provider=name):
-                self.assertTrue(spec.verified_message(args))
+                self.assertTrue(spec.verified_message(args, object()))
 
     def test_build_provider_reports_all_missing_lastfm_vars_at_once(self):
         args = self.parse(["--provider", "lastfm"])
@@ -1869,6 +2007,30 @@ class TestPlaybackStatus(unittest.TestCase):
         state.update(sm.PlaybackArt("gone", "u", True), art_image())
         state.clear()
         self.assertNotIn("gone", sm.playback_status("spotify", "record", state))
+
+    def test_prefers_the_readable_title_over_an_opaque_key(self):
+        state = sm.PlaybackState()
+        state.update(
+            sm.PlaybackArt(
+                "2b72769a-f72e-3a75-ae97-a91fae433338", "u", True, title="Britney Spears - Toxic"
+            ),
+            art_image(),
+        )
+        line = sm.playback_status("lastfm", "record", state)
+        self.assertIn("Britney Spears - Toxic", line)
+        self.assertNotIn("2b72769a", line, "an mbid tells you nothing about what is playing")
+
+    def test_falls_back_to_the_key_when_there_is_no_title(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("some-key", "u", True), art_image())
+        self.assertIn("some-key", sm.playback_status("lastfm", "record", state))
+
+    def test_clear_drops_the_title_too(self):
+        state = sm.PlaybackState()
+        state.update(sm.PlaybackArt("k", "u", True, title="Robyn - Honey"), art_image())
+        state.clear()
+        self.assertIsNone(state.title)
+        self.assertNotIn("Robyn", sm.playback_status("lastfm", "record", state))
 
 
 class TestTerminalDisplay(unittest.TestCase):
@@ -2400,7 +2562,7 @@ class TestPreviewEndToEnd(unittest.TestCase):
         factory = lambda **kwargs: real(stream=stream, terminal_size=(200, 60), **kwargs)
         with mock.patch.object(sm, "TerminalDisplay", factory), quiet():
             sm.run(args)
-        self.assertIn("demo · art · playing · demo-track", stream.getvalue())
+        self.assertIn("demo · art · playing · Demo Artist - Demo Track", stream.getvalue())
 
     def test_scaled_grid_preview_is_written_at_the_requested_size(self):
         output = self.dir / "big.png"

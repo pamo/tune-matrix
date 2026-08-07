@@ -81,7 +81,21 @@ no paid account and polls cleanly from a headless Pi.
 3. Set these in `.env`:
 
    - `LASTFM_API_KEY`
-   - `LASTFM_USER` (your Last.fm username)
+   - `LASTFM_USER` (your Last.fm username, exactly as it appears in `last.fm/user/<name>`)
+
+4. Verify, and **read the account it names back**:
+
+   ```bash
+   python spotify_matrix.py --provider lastfm --auth-only
+   ```
+
+   ```
+   Last.fm verified: user pam-o, 257,480 scrobbles. Check that is your account.
+   ```
+
+   Last.fm only rejects usernames that do not exist, so a typo that happens to be someone
+   else's account verifies happily and then quietly shows their listening instead of
+   yours. The scrobble count is there so a wrong account is obvious at a glance.
 
 Then run with `--provider lastfm`.
 
@@ -180,12 +194,13 @@ It magnifies to fill the window, draws a status line underneath, and renders int
 alternate screen buffer so your scrollback survives. Ctrl-C restores the terminal.
 
 ```
-lastfm · record · playing · Massive Attack - Teardrop · 20.0 fps · ctrl-c to stop
+lastfm · record · playing · Britney Spears - Toxic · 20.0 fps · ctrl-c to stop
 ```
 
 That line is the reason this is a debugging tool and not just a toy: it shows which
 provider answered, which style is active, whether playback is playing / paused / idle, the
-current track key, and the frame rate you are really achieving.
+track by name, and the frame rate you are really achieving. Seeing the wrong track name is
+usually the fastest way to notice a misconfiguration.
 
 Notes worth knowing:
 
