@@ -11,9 +11,10 @@ recording, and a credential-free demo mode.
 
 Supported providers:
 
-- `spotify` (default): Spotify Web API currently-playing endpoint (live, exact)
-- `lastfm`: Last.fm "now scrobbling" — universal best-effort provider that works for **any**
-  service you scrobble (Spotify, Apple Music, Tidal, Deezer, YouTube Music, ...)
+- `lastfm` (default): Last.fm "now scrobbling" — universal best-effort provider that works
+  for **any** service you scrobble (Spotify, Apple Music, Tidal, Deezer, YouTube Music, ...).
+  One free API key, no OAuth round-trip, which is why it is the default.
+- `spotify`: Spotify Web API currently-playing endpoint (live and exact, but Spotify only)
 - `youtube-music`: YouTube Music history via `ytmusicapi`
 - `demo`: synthetic playback for previewing the display with no credentials and no network
 
@@ -135,12 +136,13 @@ square panel and pasted at the origin, so a chained display would leave the rest
 chain black. Passing anything else is rejected at startup rather than silently rendering
 a fraction of the panel.
 
-Use a specific provider:
+The provider defaults to `lastfm`, so no flag is needed for it. Pick another explicitly:
 
 ```bash
+sudo -E .venv/bin/python spotify_matrix.py                          # lastfm
 sudo -E .venv/bin/python spotify_matrix.py --provider spotify
-sudo -E .venv/bin/python spotify_matrix.py --provider lastfm
 sudo -E .venv/bin/python spotify_matrix.py --provider youtube-music
+sudo -E .venv/bin/python spotify_matrix.py --provider demo          # no credentials
 ```
 
 Useful hardware options:
@@ -205,9 +207,18 @@ usually the fastest way to notice a misconfiguration.
 Notes worth knowing:
 
 - **Magnification is limited by terminal height**, because each character row carries two
-  pixel rows. A 64x64 frame needs 32 rows at 1x and 96 at 3x, so you want a tall window
-  (~100 rows) before scaling kicks in. `--preview-scale N` overrides the automatic choice,
-  and the preview warns on stderr if the frame will be clipped.
+  pixel rows. A 64x64 frame needs 64x34 at 1x, 128x66 at 2x and 256x130 at 4x, so you want
+  a tall window before scaling does much. Most windows get 1x.
+- `--preview-scale N` raises the ceiling but is **clamped to what fits**, with a note on
+  stderr saying what size window that scale would need:
+
+  ```
+  Warning: --preview-scale 4 needs a 256x130 terminal, but this one is 119x57. Falling back to 1x.
+  ```
+
+  Clamping rather than obeying is deliberate: overflowing the width makes every row
+  line-wrap, which desynchronises the in-place redraw and turns the picture into confetti.
+  A smaller preview beats a broken one. Auto-fit also re-evaluates as you resize.
 - `--preview-grid` works here too, drawing the inter-pixel gutter.
 - A frame is roughly 25 KB of escape codes, so 20 fps is ~500 KB/s. Over a slow SSH link
   use `--fps 10` or lower.
@@ -386,8 +397,8 @@ real live `nowplaying` flag.
 
 | Service       | Live cloud now-playing? | Free API credentials? | Status in this project |
 | ------------- | ----------------------- | --------------------- | ---------------------- |
-| Spotify       | Yes (exact, native)     | Yes                   | **Supported** (default) |
-| Last.fm       | "Now scrobbling" via `user.getRecentTracks` | Yes (free API key) | **Supported** — universal best-effort |
+| Spotify       | Yes (exact, native)     | Yes                   | **Supported** |
+| Last.fm       | "Now scrobbling" via `user.getRecentTracks` | Yes (free API key) | **Supported** (default) — universal best-effort |
 | YouTube Music | History only (unofficial) | Browser auth        | **Supported**, best-effort |
 | Apple Music   | No                      | No (paid program)     | Use Last.fm (scrobble) |
 | Tidal         | No official public now-playing endpoint | Limited/approval | Use Last.fm (scrobble) |

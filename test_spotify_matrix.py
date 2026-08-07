@@ -1584,8 +1584,10 @@ class TestCli(unittest.TestCase):
     def parse(self, argv):
         return sm.build_parser().parse_args(argv)
 
-    def test_provider_defaults_to_spotify(self):
-        self.assertEqual(self.parse([]).provider, "spotify")
+    def test_provider_defaults_to_lastfm(self):
+        # Last.fm covers whatever service plays the music and needs no OAuth round-trip.
+        self.assertEqual(self.parse([]).provider, "lastfm")
+        self.assertEqual(self.parse([]).provider, sm.DEFAULT_PROVIDER)
 
     def test_choices_come_from_the_provider_table(self):
         action = next(a for a in sm.build_parser()._actions if a.dest == "provider")
@@ -1633,7 +1635,7 @@ class TestProviderTable(unittest.TestCase):
         self.assertIn("LASTFM_USER", str(ctx.exception))
 
     def test_build_provider_reports_missing_spotify_vars(self):
-        args = self.parse([])
+        args = self.parse(["--provider", "spotify"])
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(SystemExit) as ctx:
                 sm.build_provider(args)
@@ -1641,14 +1643,14 @@ class TestProviderTable(unittest.TestCase):
         self.assertIn("SPOTIFY_CLIENT_SECRET", str(ctx.exception))
 
     def test_spotify_redirect_uri_has_a_default_and_is_not_required(self):
-        args = self.parse([])
+        args = self.parse(["--provider", "spotify"])
         env = {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "secret"}
         with mock.patch.dict(os.environ, env, clear=True):
             provider = sm.build_provider(args)
         self.assertEqual(provider.redirect_uri, sm.DEFAULT_REDIRECT_URI)
 
     def test_spotify_redirect_uri_can_be_overridden(self):
-        args = self.parse([])
+        args = self.parse(["--provider", "spotify"])
         env = {
             "SPOTIFY_CLIENT_ID": "cid",
             "SPOTIFY_CLIENT_SECRET": "secret",
@@ -1659,7 +1661,7 @@ class TestProviderTable(unittest.TestCase):
         self.assertEqual(provider.redirect_uri, "http://localhost:9999/cb")
 
     def test_spotify_gets_a_file_backed_token_store(self):
-        args = self.parse(["--token-cache", "/tmp/nowhere/token.json"])
+        args = self.parse(["--provider", "spotify", "--token-cache", "/tmp/nowhere/token.json"])
         env = {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "secret"}
         with mock.patch.dict(os.environ, env, clear=True):
             provider = sm.build_provider(args)
@@ -1745,15 +1747,22 @@ class TestRunStartup(unittest.TestCase):
             self.run_with(provider, extra_argv=["--auth-only"])
 
     def test_auth_only_reports_success_without_touching_the_display(self):
-        args = sm.build_parser().parse_args(["--auth-only"])
-        provider = StubProvider()
-        buffer = io.StringIO()
-        with mock.patch.object(sm, "build_provider", return_value=provider), \
-             mock.patch.object(sm, "load_dotenv"), \
-             mock.patch.object(sm, "build_display", side_effect=AssertionError("no display")), \
-             contextlib.redirect_stdout(buffer):
-            sm.run(args)
-        self.assertIn("token cached", buffer.getvalue())
+        for provider_name, expected in [
+            ("spotify", "token cached"),
+            ("lastfm", "verified"),
+            ("demo", "no credentials"),
+        ]:
+            with self.subTest(provider=provider_name):
+                args = sm.build_parser().parse_args(["--provider", provider_name, "--auth-only"])
+                buffer = io.StringIO()
+                with mock.patch.object(sm, "build_provider", return_value=StubProvider()), \
+                     mock.patch.object(sm, "load_dotenv"), \
+                     mock.patch.object(
+                         sm, "build_display", side_effect=AssertionError("no display")
+                     ), \
+                     contextlib.redirect_stdout(buffer):
+                    sm.run(args)
+                self.assertIn(expected, buffer.getvalue())
 
     def test_test_pattern_needs_no_provider_at_all(self):
         args = sm.build_parser().parse_args(
@@ -2152,6 +2161,83 @@ class TestTerminalDisplay(unittest.TestCase):
         with contextlib.redirect_stderr(errors):
             self.display().show(art_image(size=(64, 64)))
         self.assertEqual(errors.getvalue(), "")
+
+    def test_explicit_scale_is_clamped_to_what_fits(self):
+        """Overflowing the width line-wraps every row and scrambles the whole redraw."""
+        stream, errors = io.StringIO(), io.StringIO()
+        display = sm.TerminalDisplay(stream=stream, scale=4, terminal_size=(119, 57))
+        with contextlib.redirect_stderr(errors):
+            display.show(art_image(size=(64, 64)))
+        # Clamped to 1x: 64 columns by 32 rows, not 256 by 128.
+        self.assertEqual(stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK), 64 * 32)
+        self.assertIn("--preview-scale 4 needs a 256x130 terminal", errors.getvalue())
+        self.assertIn("119x57", errors.getvalue())
+        self.assertIn("Falling back to 1x", errors.getvalue())
+
+    def test_explicit_scale_is_honoured_when_it_fits(self):
+        stream, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            sm.TerminalDisplay(stream=stream, scale=4, terminal_size=(300, 140)).show(
+                art_image(size=(64, 64))
+            )
+        self.assertEqual(stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK), 256 * 128)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_clamp_warning_is_not_repeated_every_frame(self):
+        stream, errors = io.StringIO(), io.StringIO()
+        display = sm.TerminalDisplay(stream=stream, scale=8, terminal_size=(119, 57))
+        with contextlib.redirect_stderr(errors):
+            for _ in range(5):
+                display.show(art_image(size=(64, 64)))
+        self.assertEqual(errors.getvalue().count("Warning"), 1)
+
+    def test_never_magnifies_wider_than_the_terminal(self):
+        for columns, rows in [(70, 40), (119, 57), (200, 60), (64, 34)]:
+            with self.subTest(terminal=(columns, rows)):
+                stream = io.StringIO()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    sm.TerminalDisplay(
+                        stream=stream, scale=6, terminal_size=(columns, rows)
+                    ).show(art_image(size=(64, 64)))
+                widest = max(
+                    line.count(sm.TerminalDisplay.HALF_BLOCK)
+                    for line in stream.getvalue().split("\n")
+                    if sm.TerminalDisplay.HALF_BLOCK in line
+                )
+                self.assertLessEqual(widest, columns)
+
+    def test_auto_fit_tracks_a_resized_window(self):
+        stream = io.StringIO()
+        display = sm.TerminalDisplay(stream=stream, scale=None, terminal_size=(256, 100))
+        display.show(art_image(size=(64, 64)))
+        big = stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK)
+        display.terminal_size = (119, 57)
+        display.show(art_image(size=(64, 64)))
+        after = stream.getvalue().count(sm.TerminalDisplay.HALF_BLOCK) - big
+        self.assertEqual(big, 192 * 96)
+        self.assertEqual(after, 64 * 32, "shrinking the window should shrink the preview")
+
+    # --- line wrapping -----------------------------------------------------------------
+
+    def test_disables_line_wrap_while_drawing(self):
+        stream = io.StringIO()
+        display = self.display(stream)
+        display.show(art_image(size=(4, 4)))
+        self.assertIn("\x1b[?7l", stream.getvalue(), "autowrap off, so overflow truncates")
+
+    def test_restores_line_wrap_on_exit(self):
+        stream = io.StringIO()
+        with self.display(stream) as display:
+            display.show(art_image(size=(4, 4)))
+        self.assertIn("\x1b[?7h", stream.getvalue())
+
+    def test_restores_line_wrap_even_when_the_body_raises(self):
+        stream = io.StringIO()
+        with contextlib.suppress(ValueError):
+            with self.display(stream) as display:
+                display.show(art_image(size=(4, 4)))
+                raise ValueError("boom")
+        self.assertIn("\x1b[?7h", stream.getvalue())
 
     # --- status line -------------------------------------------------------------------
 

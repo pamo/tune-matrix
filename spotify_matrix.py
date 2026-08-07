@@ -891,25 +891,50 @@ class TerminalDisplay:
         self._started = False
         self._fps = 0.0
         self._last_shown_at: float | None = None
+        self._warned: set[str] = set()
+
+    def _current_terminal_size(self) -> tuple[int, int]:
+        if self.terminal_size is not None:
+            return self.terminal_size
+        columns, rows = shutil.get_terminal_size((80, 24))
+        return columns, rows
+
+    def _required_size(self, frame_size: tuple[int, int], scale: int) -> tuple[int, int]:
+        """Columns and rows needed to draw `frame_size` at `scale`, status line included."""
+        return frame_size[0] * scale, (frame_size[1] * scale) // 2 + self.RESERVED_ROWS
+
+    def _warn_once(self, message: str) -> None:
+        # stderr, so the alternate screen does not swallow it.
+        if message not in self._warned:
+            self._warned.add(message)
+            print(f"Warning: {message}", file=sys.stderr, flush=True)
 
     def _resolve_scale(self, frame_size: tuple[int, int]) -> int:
-        if self.scale is not None:
-            return self.scale
-        size = self.terminal_size or tuple(shutil.get_terminal_size((80, 24)))
-        return terminal_scale_for(frame_size, size, self.RESERVED_ROWS)
+        """Pick a magnification that actually fits, and say so when it is not what was asked.
 
-    def _warn_if_clipped(self, frame_size: tuple[int, int]) -> None:
-        columns, rows = self.terminal_size or tuple(shutil.get_terminal_size((80, 24)))
-        needed_rows = frame_size[1] // 2 + self.RESERVED_ROWS
-        if columns < frame_size[0] or rows < needed_rows:
-            # Warn on stderr before the alternate screen swallows it.
-            print(
-                f"Warning: terminal is {columns}x{rows}; an unscaled {frame_size[0]}x"
-                f"{frame_size[1]} frame needs {frame_size[0]}x{needed_rows}. "
-                "The preview will be clipped until you resize.",
-                file=sys.stderr,
-                flush=True,
+        An explicit --preview-scale is clamped rather than honoured blindly: overflowing the
+        width makes every row line-wrap, which desynchronises the in-place redraw and turns
+        the preview into confetti. A smaller picture beats a broken one.
+        """
+        columns, rows = self._current_terminal_size()
+        largest_that_fits = terminal_scale_for(frame_size, (columns, rows), self.RESERVED_ROWS)
+        chosen = largest_that_fits if self.scale is None else min(self.scale, largest_that_fits)
+
+        if self.scale is not None and self.scale > chosen:
+            need_columns, need_rows = self._required_size(frame_size, self.scale)
+            self._warn_once(
+                f"--preview-scale {self.scale} needs a {need_columns}x{need_rows} terminal, "
+                f"but this one is {columns}x{rows}. Falling back to {chosen}x."
             )
+            return chosen
+
+        need_columns, need_rows = self._required_size(frame_size, chosen)
+        if columns < need_columns or rows < need_rows:
+            self._warn_once(
+                f"terminal is {columns}x{rows} but the preview needs "
+                f"{need_columns}x{need_rows}. It will be clipped until you resize."
+            )
+        return chosen
 
     @classmethod
     def frame_to_text(cls, image: Image.Image) -> str:
@@ -952,15 +977,18 @@ class TerminalDisplay:
         return " · ".join(part for part in parts if part)
 
     def show(self, image: Image.Image) -> None:
+        scale = self._resolve_scale(image.size)
+
         if not self._started:
-            self._warn_if_clipped(image.size)
             if self.alt_screen:
                 self.stream.write("\x1b[?1049h")  # alternate screen, preserves scrollback
-            self.stream.write("\x1b[2J\x1b[?25l")  # clear, hide cursor
+            # Wrapping is off so an over-wide row is truncated rather than pushed onto the
+            # next line, which would desynchronise every subsequent redraw.
+            self.stream.write("\x1b[?7l\x1b[2J\x1b[?25l")  # no wrap, clear, hide cursor
             self._started = True
 
         self._measure_fps()
-        frame = scale_for_preview(image, self._resolve_scale(image.size), self.grid)
+        frame = scale_for_preview(image, scale, self.grid)
         # Home the cursor and overwrite in place rather than scrolling. \x1b[J at the end
         # erases anything left over from a larger previous frame.
         self.stream.write(
@@ -973,7 +1001,7 @@ class TerminalDisplay:
     def clear(self) -> None:
         if not self._started:
             return
-        self.stream.write("\x1b[0m\x1b[?25h")  # reset colours, show cursor
+        self.stream.write("\x1b[0m\x1b[?25h\x1b[?7h")  # reset colours, cursor, wrapping
         if self.alt_screen:
             self.stream.write("\x1b[?1049l")  # back to the shell, scrollback intact
         else:
@@ -1610,6 +1638,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
     ),
 }
 
+# Last.fm is the default: one free API key covers whatever service actually plays the
+# music, and it needs no OAuth round-trip on a headless Pi.
+DEFAULT_PROVIDER = "lastfm"
+
 
 def build_image_preparer(
     args: argparse.Namespace, renderer: FrameRenderer
@@ -1778,8 +1810,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         choices=tuple(PROVIDERS),
-        default="spotify",
-        help="Music provider to use for album art. 'demo' needs no credentials.",
+        default=DEFAULT_PROVIDER,
+        help=(
+            f"Music provider to use for album art (default: {DEFAULT_PROVIDER}). "
+            "'demo' needs no credentials."
+        ),
     )
     parser.add_argument(
         "--style",
