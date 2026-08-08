@@ -218,6 +218,31 @@ a second — measured at 0.018 ms per frame against a 50 ms budget.
 One caveat: both need the frame loop actually running. If you drop to `--fps 2` to save CPU
 on a static scene, `breathe` will look stepped. Leave it at 20 if you want motion.
 
+### Previewing the motion
+
+Motion needs more than one frame, so `--once` will not show it — use the live terminal
+preview or record a GIF. Both need `--scene clock` (or `photos+clock`), otherwise the clock
+is not what is on the panel:
+
+```bash
+# live, in the terminal
+python tune_matrix.py --scene clock --clock-motion breathe --preview-terminal
+
+# a GIF you can scrub through
+python tune_matrix.py --scene clock --clock-motion blink \
+  --record-gif /tmp/blink.gif --record-seconds 4 --fps 10
+
+# and over your photos
+python tune_matrix.py --scene photos+clock --clock-motion breathe \
+  --photos photos --preview-terminal
+```
+
+Use `--fps 20` when recording `breathe` — its 5-second fade needs the frames to look smooth.
+`blink` only changes twice a second, so `--fps 10` is plenty.
+
+Note that passing `--clock-motion` **writes it to `config.json`**, so it stays on for later
+runs. Set it back with `--clock-motion still` or from the web UI.
+
 Time comes from NTP over Wi-Fi, so there is no RTC to set — but after a power cut the clock
 is wrong until Wi-Fi reassociates. If that matters, an I²C RTC would fit: SCL and SDA are
 free on the bonnet.

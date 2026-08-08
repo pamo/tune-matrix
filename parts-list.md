@@ -73,6 +73,19 @@ The tradeoff is honest: you lose the option of a bright panel, and it's a soft l
 
 Don't buy a 5V/4A supply that happens to have a USB-C connector on it and call it solved. Those exist, but the connector is then just a barrel jack in a different shape — the cable is still carrying 4A, still out of spec for a non-e-marked cable, and you've gained nothing over the barrel supply except a nicer-looking plug.
 
+### How TuneShine does it with one cable and a plain brick
+
+Worth checking against the commercial product, since it's the same panel. [TuneShine](https://store.tuneshine.rocks/products/tuneshine) is also a 6.3" 64x64 display, and it ships with a USB-C cable and a **20W** power brick.
+
+That 20W is the tell. PD's 5V profile stops at 3A, which is **15W** — so a 20W brick cannot be delivering 20W at 5V. 20W over USB-C means 9V at about 2.2A, the standard profile on every 20W phone charger. So TuneShine is negotiating a higher voltage and stepping it down inside the enclosure: exactly Option A, just hidden in the box. Their 4cm depth has room for it.
+
+The second half is the budget. A 64x64 panel at full white and full brightness would want something like 38W at 5V. TuneShine allots 20W total, so it is also designed around real album art at a sensible brightness rather than a worst case that never happens: Option B's logic. It does both at once.
+
+Two useful conclusions for this build:
+
+- A single USB-C cable is not a trick, it's a converter. There's no charger that skips the conversion.
+- **20W is a realistic target, not 40W.** A 30W charger through the Pololu regulator gives roughly 3.6–4A at 5V after conversion losses, which is comfortably more than TuneShine budgets for the same panel.
+
 ## One supply or two?
 
 Adafruit's guide says the Pi "must be powered separately, from the Pi's microUSB port," then immediately says you can just use the one plug. Both are true, and one component explains why. From the [bonnet pinouts page](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/pinouts):
