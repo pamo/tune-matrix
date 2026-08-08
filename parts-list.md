@@ -173,6 +173,17 @@ Mount it **flush** against the LED face, not with an air gap. A gap blurs pixels
 
 If 4594 is out of stock, TAP Plastics and E-Street Plastics both sell black LED-diffusing acrylic cut to size. Avoid generic white translucent acrylic — it blooms.
 
+### Or print it, if you're printing the enclosure anyway
+
+Adafruit's [Blurry Analog Clock](https://learn.adafruit.com/blurry-analog-clock) skips acrylic entirely and 3D prints its diffuser in **grey translucent PLA**. If you're already printing an enclosure that's an appealing trade: one print instead of a print plus a cut-and-glue step, no scoring, and the diffuser can be a captive layer of the front bezel rather than a separate sheet you have to hold in place.
+
+The tradeoffs are real in both directions:
+
+- **PLA** is cheaper (a few grams of filament), integrates into the enclosure, and lets you tune diffusion by changing wall thickness — that project leans into it, hence "blurry".
+- **Acrylic** is more predictable. 2.6mm cast black acrylic has a known optical result; printed PLA's depends on your layer height, wall count and how translucent that particular filament really is. It also gives a glassy front face, where PLA reads matte.
+
+For a pixel-art display where you want the pixels *sharp*, I'd still start with the acrylic — the whole reason to pick black diffusion acrylic over frosted is that it sharpens pixel edges rather than blurring them, which is the opposite of what that guide wants. But if you're printing anyway, printing a test bezel first costs almost nothing and you can compare them directly.
+
 You can preview the effect before any of this arrives:
 
 ```bash
