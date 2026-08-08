@@ -11,44 +11,39 @@ Prices and stock were checked in **August 2026** and will drift. Everything link
 | Computer | Raspberry Pi Zero 2 **WH** (pre-soldered header) | $19.80 | [Adafruit 6008](https://www.adafruit.com/product/6008) |
 | Display | 64x64 RGB LED Matrix, 2.5mm pitch, 45° curb-cut | $54.95 | [Adafruit 5407](https://www.adafruit.com/product/5407) |
 | Driver | Adafruit RGB Matrix Bonnet for Raspberry Pi | $14.95 | [Adafruit 3211](https://www.adafruit.com/product/3211) |
-| Power | 5V **4A** switching supply, 5.5mm/2.1mm barrel | $14.95 | [Adafruit 1466](https://www.adafruit.com/product/1466) |
 | Diffuser | Black LED diffusion acrylic, 12" × 12", 2.6mm | $9.95 | [Adafruit 4594](https://www.adafruit.com/product/4594) |
 | Storage | 32GB **A1-rated** microSD (SanDisk Extreme, Samsung EVO Select) | ~$10 | anywhere |
 | Mounting | M3 nylon standoff + screw assortment | ~$6 | [Adafruit](https://www.adafruit.com/?q=m3+standoff) |
+| **Power** | USB-C, three parts — see [below](#powering-it-over-usb-c) | $37.90 | |
 
 The panel and the bonnet both ship with the cables they need — the 16-pin IDC ribbon and the power pigtail with spade lugs come in the box. You don't buy those separately.
 
 ## What it costs
 
-The seven parts above minus the power supply come to **$115.65**. What you add depends on how you want to power it:
+| | |
+| --- | --- |
+| Core parts (everything above except power) | $115.65 |
+| USB-C power chain | $37.90 |
+| **Total** | **$153.55** |
 
-| Build | Power parts | **Total** |
-| --- | --- | --- |
-| Barrel jack — simplest | 5V 4A supply, $14.95 | **$130.60** |
-| USB-C at 3A — fewest parts, capped brightness | breakout + pigtail, ~$4 | **~$120** |
-| USB-C at full brightness — what TuneShine does | PD breakout + regulator + pigtail, $37.90 | **$153.55** |
-| USB-C, full brightness, generic regulator | same with a $5–10 buck instead of Pololu's | **~$130** |
+That assumes you already own a 30W-or-better USB-C charger and cable. If not, add ~$20 for a brick.
 
-Both USB-C rows assume you already own a suitable charger and cable. If not, add ~$20 for a 30W brick.
+The regulator is $29.95 of that $37.90. A generic "DC-DC 5V 5A" module or an RC hobby UBEC does the same job for $5–10, which brings the build to about **$130** — you're trading published protection specs and efficiency curves for price.
 
 Not counted, because they depend on what you already have:
 
 - **Enclosure** — $0 if you 3D print it (a few dollars of filament), up to ~$30 for laser-cut acrylic or wood.
 - **A soldering iron** — you need one for the two bonnet mods below, and one of them is mandatory. If you don't own one, ~$25–40.
 
-**For comparison, [TuneShine sells for $199.99](https://store.tuneshine.rocks/products/tuneshine)** with the same 6.3" 64x64 panel, in a finished wood enclosure, with its own app and cloud service. So building it saves roughly **$50–80** — real, but not the reason to do it. You're doing it for the parts you get to choose: your own photos, your own idle scenes, no subscription, and a display you can change the behaviour of.
+**For comparison, [TuneShine sells for $199.99](https://store.tuneshine.rocks/products/tuneshine)** with the same 6.3" 64x64 panel, in a finished wood enclosure, with its own app and cloud service. So building it saves roughly **$50** — real, but not the reason to do it. You're doing it for the parts you get to choose: your own photos, your own idle scenes, no subscription, and a display you can change the behaviour of.
 
 ## Powering it over USB-C
 
-You want one USB-C cable rather than a barrel-jack wall wart. That's very doable, but there's a spec wall to get around first, and it's the reason I steered away from USB-C originally.
+One USB-C cable to the wall, and a flush USB-C port on the enclosure. There's a spec wall in the way, and getting around it is what the three power parts are for.
 
 **USB-C Power Delivery caps its 5V profile at 3A.** 5V/4A is not a standard PD voltage, so no amount of shopping produces a USB-C charger that will hand you 4A at 5V. On top of that, a plain USB-C cable is only rated for 3A unless it's e-marked for 5A. Pushing 4A down a generic cable is out of spec regardless of what the charger claims.
 
-There are two honest ways around this. The first is better; the second is fewer parts.
-
-### Option A: ask the charger for 9V, then step down to 5V
-
-Negotiate a **higher** voltage over USB-C, then convert it to 5V locally. This is the right answer, and it fixes the cable problem as a side effect: at 9V you only draw ~2A for the same 18W, which is comfortably inside a standard 3A cable's rating. All the high current exists on the 5V side, after the converter, on two inches of wire inside your enclosure.
+So: negotiate a **higher** voltage over USB-C, then convert it to 5V locally. This fixes the cable problem as a side effect — at 9V you draw only ~2A for the same 18W, comfortably inside a standard cable's rating. All the high current exists on the 5V side, after the converter, on two inches of wire inside your enclosure.
 
 | Part | What it does | Price | Where |
 | --- | --- | --- | --- |
@@ -57,37 +52,19 @@ Negotiate a **higher** voltage over USB-C, then convert it to 5V locally. This i
 | Male 2.1mm barrel pigtail | Screw terminals on one end, a plug for the bonnet's jack on the other. | $2.00 | [Adafruit 369](https://www.adafruit.com/product/369) |
 | USB-C charger, 30W or better | Must actually offer 9V. A 30W phone charger or any USB-C laptop brick will. | — | you probably own one |
 
-**$37.90 of extra parts**, against the $14.95 barrel supply you no longer need — so about **$23 net** to move to USB-C.
-
-The regulator is most of that. Pololu's is the well-documented choice, with real protection circuitry and published efficiency curves. If $30 is too much for one part, a generic "DC-DC 5V 5A" module or an RC hobby UBEC does the same job for $5–10; you are trading documentation and protection for price, which is a reasonable trade in a box that already has a fused supply upstream.
-
 Wiring is a short chain: charger → USB-C cable → PD breakout (set to 9V) → regulator input → regulator 5V output → barrel pigtail → the bonnet's DC jack.
 
-Two details worth getting right:
+Three details worth getting right:
 
 - **Set the PD breakout to 9V or 12V, not 5V.** The regulator needs at least 6V in. Feeding it 5V gives you nothing.
-- **Keep the barrel jack in the chain** rather than wiring the regulator straight to the bonnet's screw terminals. The jack is behind the bonnet's over-voltage protection; the terminal block isn't.
+- **Keep the barrel jack in the chain** rather than wiring the regulator straight to the bonnet's screw terminals. The jack sits behind the bonnet's over-voltage protection; the terminal block doesn't.
+- **Check the charger actually offers 9V.** Most 20W-and-up USB-C bricks do, but a cheap 5V-only charger will leave the PD breakout unable to negotiate and nothing will light up.
 
-The nice outcome: one USB-C cable to the wall, a flush USB-C port on your enclosure, and full brightness headroom.
+The outcome: one USB-C cable to the wall, a flush port on the enclosure, and enough headroom that brightness is a free choice rather than a budget you're managing.
 
-### Option B: accept 3A and turn the brightness down
+### If you'd rather not
 
-Skip the conversion entirely. Feed 5V straight from a USB-C PD charger into the bonnet and live inside 3A.
-
-| Part | What it does | Price | Where |
-| --- | --- | --- | --- |
-| USB-C breakout with CC resistors | Two 5.1kΩ pulldowns on the CC pins, which is what makes a charger actually deliver 5V. Without them you get nothing. | ~$2 | [Adafruit 4090](https://www.adafruit.com/product/4090) |
-| Male 2.1mm barrel pigtail | Into the bonnet's jack. | $2.00 | [Adafruit 369](https://www.adafruit.com/product/369) |
-
-This works because **brightness is the current knob**. A 64x64 panel showing full white at full brightness is a theoretical 7.68A; current scales roughly with brightness, so about 40% brightness keeps even a white album cover inside 3A. Treat that as an estimate, not a guarantee — real panels draw less than the theoretical maximum, but the direction is right.
-
-Which is fine, because you'll probably want it dimmer anyway. 65% is bright in a dark room; I'd already suggested 40 for a shelf. Set a ceiling in `config.json` or from the web UI:
-
-```json
-{ "brightness": 40 }
-```
-
-The tradeoff is honest: you lose the option of a bright panel, and it's a soft limit rather than a hard one. If you later want it brighter, that's Option A.
+A plain **5V 4A barrel supply** ([Adafruit 1466](https://www.adafruit.com/product/1466), $14.95) replaces all three parts and is $23 cheaper. You lose the single-USB-C tidiness and gain a wall wart with a barrel plug. Everything else in this list is unchanged.
 
 ### What not to do
 
@@ -97,14 +74,14 @@ Don't buy a 5V/4A supply that happens to have a USB-C connector on it and call i
 
 Worth checking against the commercial product, since it's the same panel. [TuneShine](https://store.tuneshine.rocks/products/tuneshine) is also a 6.3" 64x64 display, and it ships with a USB-C cable and a **20W** power brick.
 
-That 20W is the tell. PD's 5V profile stops at 3A, which is **15W** — so a 20W brick cannot be delivering 20W at 5V. 20W over USB-C means 9V at about 2.2A, the standard profile on every 20W phone charger. So TuneShine is negotiating a higher voltage and stepping it down inside the enclosure: exactly Option A, just hidden in the box. Their 4cm depth has room for it.
+That 20W is the tell. PD's 5V profile stops at 3A, which is **15W** — so a 20W brick cannot be delivering 20W at 5V. 20W over USB-C means 9V at about 2.2A, the standard profile on every 20W phone charger. So TuneShine is negotiating a higher voltage and stepping it down inside the enclosure — exactly the chain above, just hidden in the box. Their 4cm depth has room for it.
 
-The second half is the budget. A 64x64 panel at full white and full brightness would want something like 38W at 5V. TuneShine allots 20W total, so it is also designed around real album art at a sensible brightness rather than a worst case that never happens: Option B's logic. It does both at once.
+The second half is the budget. A 64x64 panel at full white and full brightness would want something like 38W at 5V. TuneShine allots 20W total, so it is also designed around real album art at a sensible brightness rather than a worst case that never happens.
 
 Two useful conclusions for this build:
 
 - A single USB-C cable is not a trick, it's a converter. There's no charger that skips the conversion.
-- **20W is a realistic target, not 40W.** A 30W charger through the Pololu regulator gives roughly 3.6–4A at 5V after conversion losses, which is comfortably more than TuneShine budgets for the same panel.
+- **20W is a realistic target, not 40W.** A 30W charger through the regulator gives roughly 3.6–4A at 5V after conversion losses, comfortably more than TuneShine budgets for the same panel. So the chain above isn't over-built — it's the same call the product makes.
 
 ## One supply or two?
 
@@ -159,9 +136,9 @@ The USB-C parts aren't DigiKey-friendly either: the Pololu regulator is best bou
 
 ## Why 4A and not 3A
 
-The original plan was a 5V 3A USB-C wall wart feeding the bonnet. Adafruit's own docs call for **5V 4A or larger** on a 64x64, and full white on this panel is a theoretical 7.68A. Album art won't hit that, but a bright cover at full brightness will sag a 3A rail — and since the Pi is powered through the bonnet off that same rail, a sag isn't a dim frame, it's an unclean shutdown and eventually a corrupt SD card.
+The original plan was a 5V 3A USB-C wall wart straight into the bonnet. Adafruit's own docs call for **5V 4A or larger** on a 64x64, and full white on this panel is a theoretical 7.68A. Album art won't hit that, but a bright cover at full brightness will sag a 3A rail — and since the Pi is powered through the bonnet off that same rail, a sag isn't a dim frame, it's an unclean shutdown and eventually a corrupt SD card.
 
-That's the whole reason the USB-C section above exists rather than just saying "use USB-C." 3A is workable, but only if you decide to live inside it deliberately.
+That's the whole reason the power chain above exists rather than just plugging a charger in. Brightness is effectively the current knob, so 3A is survivable if you keep the panel dim — but then the brightness slider in the web UI becomes something you must remember not to touch, and the failure mode is a corrupt SD card rather than a dim panel. Buying the headroom removes a footgun, not just a limit.
 
 ## Add the diffuser
 

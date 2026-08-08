@@ -1,5 +1,8 @@
 # Tune Matrix
 
+> Grown out of [tnarla/spotify-matrix](https://github.com/tnarla/spotify-matrix), which is
+> where the spinning-record idea and the original Spotify polling script come from. 
+
 Shows current album art on a 64x64 RGB matrix as a spinning record or as static full-bleed
 art, and can fall back to a clock or your own photos when nothing is playing (see
 [Scenes](#scenes)). In the default record style the album art is the record surface itself:
