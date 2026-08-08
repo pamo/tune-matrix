@@ -197,6 +197,27 @@ pixel. Digits sit in fixed-width cells so the time does not shuffle sideways as 
 Over a photo the digits get a 1px black halo, which keeps white text readable on a pale
 image while hiding far less of the picture than a dark box would.
 
+`clock_motion` picks how it moves, and applies whether the clock is on its own or over a
+photo. Default is `still`, because unrequested motion on a wall display is noise:
+
+| Motion | What it does |
+| --- | --- |
+| `still` | Redrawn only when the minute changes. |
+| `blink` | The colon flashes each half second, like a bedside clock. |
+| `breathe` | The digits fade between dim and full over 5 seconds. |
+
+```bash
+tune_matrix.py --clock-motion breathe
+```
+
+`blink` swaps the colon for a same-width space rather than removing it, so the digits never
+shift. `breathe` never fades below 35%, so the time stays readable throughout, and its
+brightness is quantised to 24 steps so frames are still cached rather than redrawn 20 times
+a second — measured at 0.018 ms per frame against a 50 ms budget.
+
+One caveat: both need the frame loop actually running. If you drop to `--fps 2` to save CPU
+on a static scene, `breathe` will look stepped. Leave it at 20 if you want motion.
+
 Time comes from NTP over Wi-Fi, so there is no RTC to set — but after a power cut the clock
 is wrong until Wi-Fi reassociates. If that matters, an I²C RTC would fit: SCL and SDA are
 free on the bonnet.

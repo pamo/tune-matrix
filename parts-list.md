@@ -1,10 +1,8 @@
 # Parts List
 
-Hardware BOM for the spinning-record display. Optimized for a **lo-fi look done well**: chunky
-visible pixels, no glare, no flicker, thin enough to sit on a shelf and not look like a science fair
-project.
+Hardware BOM for the Tune Matrix display. Optimized for a **lo-fi look done well**: chunky visible pixels, no glare, no flicker, thin enough to sit on a shelf and not look like a science fair project.
 
-Prices and stock are as of **August 2026** and will drift. Everything links to a real product page.
+Prices and stock were checked in **August 2026** and will drift. Everything links to a real product page.
 
 ## The picks
 
@@ -15,130 +13,188 @@ Prices and stock are as of **August 2026** and will drift. Everything links to a
 | Driver | Adafruit RGB Matrix Bonnet for Raspberry Pi | $14.95 | [Adafruit 3211](https://www.adafruit.com/product/3211) |
 | Power | 5V **4A** switching supply, 5.5mm/2.1mm barrel | $14.95 | [Adafruit 1466](https://www.adafruit.com/product/1466) |
 | Diffuser | Black LED diffusion acrylic, 12" × 12", 2.6mm | $9.95 | [Adafruit 4594](https://www.adafruit.com/product/4594) |
-| Storage | 32GB **A1-rated** microSD (SanDisk Extreme, Samsung EVO Select) | ~$10 | [Adafruit](https://www.adafruit.com/?q=microsd) / anywhere |
+| Storage | 32GB **A1-rated** microSD (SanDisk Extreme, Samsung EVO Select) | ~$10 | anywhere |
 | Mounting | M3 nylon standoff + screw assortment | ~$6 | [Adafruit](https://www.adafruit.com/?q=m3+standoff) |
 
-**Total: ~$132.** Add an enclosure (below) if you're not 3D printing one.
+**Total: ~$132.** Add an enclosure if you're not 3D printing one, and see below if you want USB-C power instead of the barrel jack.
 
-The panel and the bonnet both ship with the cables they need — the 16-pin IDC ribbon and the power
-pigtail with spade lugs come in the box. You don't buy those separately.
+The panel and the bonnet both ship with the cables they need — the 16-pin IDC ribbon and the power pigtail with spade lugs come in the box. You don't buy those separately.
 
-## Changes from the original list, and why
+## Powering it over USB-C
 
-### Drop the USB-C power path entirely
+You want one USB-C cable rather than a barrel-jack wall wart. That's very doable, but there's a spec wall to get around first, and it's the reason I steered away from USB-C originally.
 
-Original list had a 5V **3A** USB-C wall wart + a USB-C female breakout + hookup wire, feeding the
-bonnet's screw terminals. Three problems:
+**USB-C Power Delivery caps its 5V profile at 3A.** 5V/4A is not a standard PD voltage, so no amount of shopping produces a USB-C charger that will hand you 4A at 5V. On top of that, a plain USB-C cable is only rated for 3A unless it's e-marked for 5A. Pushing 4A down a generic cable is out of spec regardless of what the charger claims.
 
-1. **3A is undersized.** Adafruit's own bonnet docs call for **5V 4A or larger** on a 64x64. Full
-   white on this panel is a theoretical 7.68A. Album art won't hit that, but a bright white cover at
-   full brightness will sag a 3A rail — and the Pi is powered *through* the bonnet off that same
-   rail, so a sag isn't a dim frame, it's an unclean shutdown and eventually a corrupt SD card.
-2. **You can't fix it by buying a bigger USB-C brick.** USB-C PD caps 5V at 3A. Getting 4A+ at 5V
-   over USB-C requires a fixed-voltage non-PD supply that specifically advertises it, which is rare
-   and not worth hunting for.
-3. **The breakout back-feeds the wrong connector.** The bonnet's screw terminal block is the *output*
-   to the panel; the barrel jack is the *input*, and it's the side with the reverse-polarity and
-   over/under-voltage protection. Wiring into the terminal block works electrically but skips the
-   protection circuit.
+There are two honest ways around this. The first is better; the second is fewer parts.
 
-The barrel-jack supply is cheaper than the two parts it replaces, deletes a soldering step, and is
-the configuration Adafruit actually tests. If you want a flush USB-C port on the enclosure purely for
-looks, that's a legitimate reason to go back — just source a fixed 5V 4A+ supply and use a breakout
-with 5.1kΩ CC pulldowns.
+### Option A: ask the charger for 9V, then step down to 5V
 
-### Buy the Pi with headers, and don't pay $38
+Negotiate a **higher** voltage over USB-C, then convert it to 5V locally. This is the right answer, and it fixes the cable problem as a side effect: at 9V you only draw ~2A for the same 18W, which is comfortably inside a standard 3A cable's rating. All the high current exists on the 5V side, after the converter, on two inches of wire inside your enclosure.
 
-$38 for a Pi Zero 2 W is roughly 2× MSRP — that's a reseller markup, probably because Adafruit's is
-frequently out of stock. Check [rpilocator](https://rpilocator.com/?cat=PIZERO2) for in-stock
-listings at real prices; PiShop.us, CanaKit, and Micro Center all carry it.
+| Part | What it does | Price | Where |
+| --- | --- | --- | --- |
+| USB-C PD sink breakout (HUSB238) | Negotiates 9V or 12V from the charger instead of 5V. Jumper-selectable. | ~$8 | [Adafruit 5807](https://www.adafruit.com/product/5807) |
+| 5V 5A step-down regulator | Converts that down to a solid 5V with 5A of headroom. Input range 6–38V, 85–95% efficient, with reverse-voltage, over-current, short-circuit and thermal protection built in. | ~$17 | [Pololu D24V50F5](https://www.pololu.com/product/2851) |
+| Male 2.1mm barrel pigtail | Screw terminals on one end, a plug for the bonnet's jack on the other. | $2.00 | [Adafruit 369](https://www.adafruit.com/product/369) |
+| USB-C charger, 30W or better | Must actually offer 9V. A 30W phone charger or any USB-C laptop brick will. | — | you probably own one |
 
-Get the **WH** (pre-soldered 2x20 header). The bonnet needs a full header, and hand-soldering 40 pins
-onto a Zero to save $4 is not a good trade.
+Roughly **$27 of extra parts**, and you can drop the $14.95 barrel supply from the main list, so call it $12 net.
 
-### Add the diffuser
+Wiring is a short chain: charger → USB-C cable → PD breakout (set to 9V) → regulator input → regulator 5V output → barrel pigtail → the bonnet's DC jack.
 
-This is the single largest visual difference between "DIY LED sign" and something you'd leave out on
-a shelf. Bare, the panel is 4096 point sources with visible black grid lines and enough glare to be
-unpleasant at desk distance.
+Two details worth getting right:
 
-Adafruit's **black** diffusion acrylic is the right material — unlike frosted or smoke-tinted acrylic
-it *sharpens* the pixel edges while killing glare, and it makes the display read as a black slab when
-it's off. Buy the 12" × 12" sheet and cut it down to the panel's 160mm × 160mm; it scores and snaps,
-and it laser cuts cleanly if you have access to one.
+- **Set the PD breakout to 9V or 12V, not 5V.** The regulator needs at least 6V in. Feeding it 5V gives you nothing.
+- **Keep the barrel jack in the chain** rather than wiring the regulator straight to the bonnet's screw terminals. The jack is behind the bonnet's over-voltage protection; the terminal block isn't.
 
-Mount it **flush** against the LED face, not with an air gap. A gap blurs pixels into each other,
-which is the opposite of what a pixel-art aesthetic wants.
+The nice outcome: one USB-C cable to the wall, a flush USB-C port on your enclosure, and full brightness headroom.
 
-If 4594 is out of stock, TAP Plastics and E-Street Plastics both sell black LED-diffusing acrylic cut
-to size. Avoid generic white translucent acrylic — it blooms.
+### Option B: accept 3A and turn the brightness down
+
+Skip the conversion entirely. Feed 5V straight from a USB-C PD charger into the bonnet and live inside 3A.
+
+| Part | What it does | Price | Where |
+| --- | --- | --- | --- |
+| USB-C breakout with CC resistors | Two 5.1kΩ pulldowns on the CC pins, which is what makes a charger actually deliver 5V. Without them you get nothing. | ~$2 | [Adafruit 4090](https://www.adafruit.com/product/4090) |
+| Male 2.1mm barrel pigtail | Into the bonnet's jack. | $2.00 | [Adafruit 369](https://www.adafruit.com/product/369) |
+
+This works because **brightness is the current knob**. A 64x64 panel showing full white at full brightness is a theoretical 7.68A; current scales roughly with brightness, so about 40% brightness keeps even a white album cover inside 3A. Treat that as an estimate, not a guarantee — real panels draw less than the theoretical maximum, but the direction is right.
+
+Which is fine, because you'll probably want it dimmer anyway. 65% is bright in a dark room; I'd already suggested 40 for a shelf. Set a ceiling in `config.json` or from the web UI:
+
+```json
+{ "brightness": 40 }
+```
+
+The tradeoff is honest: you lose the option of a bright panel, and it's a soft limit rather than a hard one. If you later want it brighter, that's Option A.
+
+### What not to do
+
+Don't buy a 5V/4A supply that happens to have a USB-C connector on it and call it solved. Those exist, but the connector is then just a barrel jack in a different shape — the cable is still carrying 4A, still out of spec for a non-e-marked cable, and you've gained nothing over the barrel supply except a nicer-looking plug.
+
+## One supply or two?
+
+Adafruit's guide says the Pi "must be powered separately, from the Pi's microUSB port," then immediately says you can just use the one plug. Both are true, and one component explains why. From the [bonnet pinouts page](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/pinouts):
+
+> The driving Raspberry Pi must be powered separately, from the Pi's microUSB port but we do have a **1A diode on board** that will automatically power the Pi if/when the voltage drops. So if you want, just plug in the 5V wall adapter into the bonnet and it will automagically power up the Pi too!
+
+The barrel jack feeds the panel directly and feeds the Pi **through a 1A diode**. That diode is doing two jobs, and each explains half the advice:
+
+- **It lets one supply run everything.** Plug in the barrel jack and the Pi comes up too.
+- **It's also why one supply is second-best.** A diode drops a few tenths of a volt, so the Pi sees meaningfully less than the 5V at the jack — and the Pi's undervoltage warning trips just under 4.7V, so you start close to the line. The panel's draw then swings by amps as the image changes, sagging that rail further exactly when a bright frame appears.
+
+There's no backfeed risk in powering both. The diode only conducts toward the Pi, which is precisely why plugging a supply into the Pi's own port as well is safe rather than two supplies fighting.
+
+**What I'd actually do.** For this build — one 64x64 panel and a Pi Zero 2 W — one supply is fine, and it's what most single-panel Zero builds run. A Zero 2 W draws a couple of hundred milliamps, nowhere near the diode's 1A ceiling. Give it headroom and keep the cable short.
+
+Go to two supplies if any of these apply:
+
+- You see undervoltage. Check it rather than guess — `0x0` means clean, and a non-zero result with bit 16 set means it has browned out since boot:
+  ```bash
+  vcgencmd get_throttled
+  ```
+- You swap in a Pi 3 or 4 later. Their peaks exceed 1A, so the diode becomes a bottleneck instead of a convenience.
+- The display is doing anything you'd be annoyed to lose to a corrupt SD card.
+
+Two supplies means 5V 4A into the bonnet's barrel jack for the panel, plus any decent 5V 2.5A supply into the Pi's own **PWR IN** port.
+
+Also worth knowing: there's a **green LED next to the DC jack**. If it isn't lit, the bonnet has no good 5V and nothing else you try will work.
+
+## Ordering from DigiKey
+
+DigiKey stocks most of this, which is worth it for one order and one shipping charge. Part numbers, prices and stock below were each checked on a live DigiKey product page in August 2026.
+
+| Part | DigiKey PN | Price | Stock when checked |
+| --- | --- | --- | --- |
+| 64x64 P2.5 panel | [1528-5407-ND](https://www.digikey.com/en/products/detail/adafruit-industries-llc/5407/16499340) | $54.95 | **3** — thin, check before planning around it |
+| RGB Matrix Bonnet | [1528-2557-ND](https://www.digikey.com/en/products/detail/adafruit-industries-llc/3211/8535237) | $14.95 | 827 |
+| Black diffusion acrylic, 12" × 12" | [1528-4594-ND](https://www.digikey.com/en/products/detail/adafruit-industries-llc/4594/12822316) | $9.95 | 148 |
+| Male 2.1mm barrel pigtail | [search "adafruit 369"](https://www.digikey.com/en/products/result?keywords=adafruit%20369) | $2.00 | didn't verify the PN |
+| 5V 4A supply, 5.5/2.1mm barrel | [1528-1466AD-ND](https://www.digikey.com/en/products/detail/adafruit-industries-llc/1466/10670047) | $14.95 | **Not stocked** — 4-week lead |
+| Pi Zero 2 W (**no header**) | [2648-SC1176-ND](https://www.digikey.com/en/products/detail/raspberry-pi/SC1176/15298147) | $15.00 | **0** |
+| MicroSD card | [browse](https://www.digikey.com/en/products/result?keywords=microsd%20card) | ~$10 | plenty |
+| M3 standoffs and screws | [browse](https://www.digikey.com/en/products/result?keywords=m3%20standoff%20nylon) | ~$6 | plenty |
+
+### Two things DigiKey can't do for you
+
+**The Pi.** DigiKey lists only the headerless Zero 2 W, and it was at zero stock when I checked. The parts list calls for the **WH** because the bonnet needs a full 40-pin header, and I couldn't find a WH listing at DigiKey at all. So either buy the WH elsewhere — [Adafruit 6008](https://www.adafruit.com/product/6008) or [PiShop SC0721](https://www.pishop.us/product/raspberry-pi-zero-2w-with-headers/) — or buy the headerless one from DigiKey and solder on a 2x20 header. That's 40 joints to save about $4, which is a bad trade unless you enjoy it. Check [rpilocator](https://rpilocator.com/?cat=PIZERO2) for whoever has stock today.
+
+**The barrel supply.** Adafruit's 1466 is a special-order item at DigiKey with a 4-week lead time, which defeats the point of consolidating the order. DigiKey suggests [PSAD36BSF-10-B2](https://www.digikey.com/en/products/result?keywords=PSAD36BSF-10-B2) (TT Electronics, 5V 20W = 4A, ~$14.30, in stock). The wattage is right — **verify the barrel is 5.5mm OD / 2.1mm ID and centre-positive before ordering**, because that's the one spec that will silently not fit. Any 5V ≥4A supply with that barrel works; there's nothing special about Adafruit's. Moot if you go the USB-C route.
+
+The USB-C parts aren't DigiKey-friendly either: the Pololu regulator is best bought direct from [Pololu](https://www.pololu.com/product/2851).
+
+## Why 4A and not 3A
+
+The original plan was a 5V 3A USB-C wall wart feeding the bonnet. Adafruit's own docs call for **5V 4A or larger** on a 64x64, and full white on this panel is a theoretical 7.68A. Album art won't hit that, but a bright cover at full brightness will sag a 3A rail — and since the Pi is powered through the bonnet off that same rail, a sag isn't a dim frame, it's an unclean shutdown and eventually a corrupt SD card.
+
+That's the whole reason the USB-C section above exists rather than just saying "use USB-C." 3A is workable, but only if you decide to live inside it deliberately.
+
+## Add the diffuser
+
+This is the single largest visual difference between "DIY LED sign" and something you'd leave out on a shelf. Bare, the panel is 4096 point sources with visible black grid lines and enough glare to be unpleasant at desk distance.
+
+Adafruit's **black** diffusion acrylic is the right material — unlike frosted or smoke-tinted acrylic it *sharpens* the pixel edges while killing glare, and it makes the display read as a black slab when it's off. Buy the 12" × 12" sheet and cut it down to the panel's 160mm × 160mm; it scores and snaps, and laser cuts cleanly.
+
+Mount it **flush** against the LED face, not with an air gap. A gap blurs pixels into each other, which is the opposite of what a pixel-art aesthetic wants.
+
+If 4594 is out of stock, TAP Plastics and E-Street Plastics both sell black LED-diffusing acrylic cut to size. Avoid generic white translucent acrylic — it blooms.
+
+You can preview the effect before any of this arrives:
+
+```bash
+python tune_matrix.py --scene photos --photos ~/Pictures/test \
+  --mock-output /tmp/p.png --preview-scale 10 --preview-grid --once
+```
+
+`--preview-grid` draws the inter-pixel gutter, which approximates how the panel reads behind the diffuser.
 
 ## Two solder mods you should do
 
-Both take five minutes and neither is optional if you care about how this looks.
+Both take five minutes and neither is optional if you care how this looks.
 
-**1. Address-E jumper — mandatory.** 64x64 panels use 5-address (ABCDE) multiplexing. On the bottom
-of the bonnet, bridge the middle pad to **8** with a blob of solder. Skip this and you get half an
-image. ([Adafruit's matrix setup guide](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/matrix-setup))
+**1. Address-E jumper — mandatory.** 64x64 panels use 5-address (ABCDE) multiplexing. On the bottom of the bonnet, bridge the middle pad to **8** with a blob of solder. Skip this and you get half an image. ([Adafruit's matrix setup guide](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/matrix-setup))
 
-**2. GPIO4 ↔ GPIO18 jumper — the "quality" mod.** A single wire between these two pads enables
-hardware PWM, which is the difference between a visibly flickering panel and a rock-solid one. The
-cost is onboard audio (HDMI and the 1/8" jack), which this project does not use.
+**2. GPIO4 ↔ GPIO18 jumper — the "quality" mod.** A single wire between these two pads enables hardware PWM, which is the difference between a visibly flickering panel and a rock-solid one. The cost is onboard audio, which this project doesn't use.
 
-This one has a direct effect on the run command in the README. Today you're running:
+That second one changes the run command:
 
-```
---hardware-mapping adafruit-hat --no-hardware-pulse --gpio-slowdown 4
-```
-
-That's the flicker-prone fallback config. After the mod:
-
-```
+```bash
 --hardware-mapping adafruit-hat-pwm --gpio-slowdown 2
 ```
 
-Also worth adding `isolcpus=3` to `/boot/cmdline.txt` — it dedicates a core to the matrix refresh and
-noticeably steadies the image on a Zero 2 W.
+Without the mod you're stuck on the flicker-prone fallback:
+
+```bash
+--hardware-mapping adafruit-hat --no-hardware-pulse --gpio-slowdown 4
+```
+
+Also worth adding `isolcpus=3` to `/boot/cmdline.txt` — it dedicates a core to the matrix refresh and noticeably steadies the image on a Zero 2 W.
 
 ## On the Pi Zero 2 W
 
-The README notes the `rgbmatrix` bindings install crashed the Zero and suggests a Pi with more
-memory. That crash is the compiler running out of RAM, not a fundamental limit — bump the swapfile to
-1GB (`/etc/dphys-swapfile`, set `CONF_SWAPSIZE=1024`, restart the service) and it builds fine.
+Installing the `rgbmatrix` bindings can crash a Zero — that's the compiler running out of RAM, not a fundamental limit. Bump the swapfile to 1GB (`/etc/dphys-swapfile`, set `CONF_SWAPSIZE=1024`, restart the service) and it builds fine.
 
-Keeping the Zero 2 W is the right call here specifically because this is a **display**: it fits
-inside the panel's own depth, so the whole thing stays thin. A Pi 4 hangs off the back and doubles
-the enclosure thickness.
+Keeping the Zero 2 W is the right call for a **display**: it fits inside the panel's own depth, so the whole thing stays thin. A Pi 4 hangs off the back and doubles the enclosure thickness.
 
-That said, the Zero 2 W is the slowest board hzeller's library supports, and a spinning record is
-animation, not a static frame. If you do the PWM mod and still can't get a clean refresh, the escape
-hatch is a **Pi 3A+** (same slim-ish footprint) or a **Pi 4 2GB** (no fuss, thicker build). Do not
-buy a Pi 5 — hzeller's Pi 5 support was still
-[experimental as of early 2026](https://github.com/hzeller/rpi-rgb-led-matrix/issues/1878) because
-the RP1 chip changed the GPIO architecture out from under the library.
+That said, the Zero 2 W is the slowest board hzeller's library supports. If you do the PWM mod and still can't get a clean refresh, the escape hatch is a **Pi 3A+** (similar slim footprint) or a **Pi 4 2GB** (no fuss, thicker build). Note a Pi 3/4 also pushes you to two power supplies, since their peaks exceed the bonnet diode's 1A.
+
+Don't buy a Pi 5 — hzeller's Pi 5 support was still [experimental as of early 2026](https://github.com/hzeller/rpi-rgb-led-matrix/issues/1878) because the RP1 chip changed the GPIO architecture out from under the library.
 
 ## Enclosure and sizing
 
-- Panel is **160mm × 160mm** (64 × 2.5mm pitch), roughly 6.3" square, plus ~14mm depth for the panel
-  body and connectors on the back.
-- The 45° curb-cut on 5407 exists so panels can butt together edge-to-edge into cubes. Harmless on a
-  single flat panel, but the chamfered corners mean a square bezel won't sit perfectly flush — design
-  the frame with a small corner radius or a rebate.
-- The panel has M3 threaded studs on the back. That's what the standoffs are for: they hold the Pi +
-  bonnet stack off the panel body so nothing shorts.
-- Give the bonnet some airflow. It doesn't run hot, but the panel does at high brightness, and a
-  fully sealed box traps it.
+- The panel is **160mm × 160mm** (64 × 2.5mm pitch), roughly 6.3" square, plus ~14mm depth for the panel body and rear connectors.
+- The 45° curb-cut on 5407 exists so panels can butt together into cubes. Harmless on a single flat panel, but the chamfered corners mean a square bezel won't sit perfectly flush — design the frame with a small corner radius or a rebate.
+- The panel has M3 threaded studs on the back. That's what the standoffs are for: they hold the Pi + bonnet stack off the panel body so nothing shorts.
+- Going the USB-C route adds two small boards to find room for. Both are under an inch square, and they sit between your panel-mount USB-C port and the bonnet's jack.
+- Give the bonnet some airflow. It doesn't run hot, but the panel does at high brightness, and a fully sealed box traps it.
 
-## Things you do not need
+## Things you don't need
 
 - **Heatsinks.** Not at this workload.
-- **A real-time clock.** The Pi is on Wi-Fi; NTP handles it.
-- **A separate Pi power supply.** The bonnet feeds 5V back to the Pi over the header. One supply,
-  one cable.
+- **A real-time clock.** The Pi is on Wi-Fi and NTP handles it. Caveat: after a power cut the clock is wrong until Wi-Fi reassociates. If that bothers you, an I²C RTC fits — SCL and SDA are free on the bonnet.
+- **A 5A e-marked USB-C cable.** Only if you ignore the advice above and try to pull 4A at 5V over the cable.
 
 ---
 
-Sources: [RGB Matrix Bonnet setup guide](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/matrix-setup) ·
-[Bonnet product page](https://www.adafruit.com/product/3211) ·
-[64x64 P2.5 curb-cut panel](https://www.adafruit.com/product/5407) ·
-[hzeller/rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix)
+Sources: [RGB Matrix Bonnet setup guide](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/matrix-setup) · [Bonnet pinouts](https://learn.adafruit.com/adafruit-rgb-matrix-bonnet-for-raspberry-pi/pinouts) · [64x64 P2.5 curb-cut panel](https://www.adafruit.com/product/5407) · [HUSB238 PD breakout guide](https://learn.adafruit.com/adafruit-husb238-usb-type-c-power-delivery-breakout/overview) · [Pololu D24V50F5](https://www.pololu.com/product/2851) · [hzeller/rpi-rgb-led-matrix](https://github.com/hzeller/rpi-rgb-led-matrix)

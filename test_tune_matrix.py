@@ -2887,7 +2887,7 @@ class TestConfigOverridesFromArgs(unittest.TestCase):
     def test_every_configurable_flag_is_covered(self):
         argv = [
             "--style", "art", "--scene", "clock", "--idle-scene", "clock", "--rpm", "45",
-            "--photo-seconds", "12", "--clock-24-hour",
+            "--photo-seconds", "12", "--clock-24-hour", "--clock-motion", "breathe",
         ]
         self.assertEqual(
             set(sm.config_overrides_from(self.parse(argv))),
@@ -3256,6 +3256,171 @@ class TestClockScene(unittest.TestCase):
         first = scene.frame(0.0).tobytes()
         fmt["24"] = False
         self.assertNotEqual(first, scene.frame(1.0).tobytes())
+
+
+class TestClockMotion(unittest.TestCase):
+    """Blink and breathe. Both off by default: unrequested motion on a wall display is noise."""
+
+    def scene(self, motion, microsecond=0, size=64):
+        return sm.ClockScene(
+            size,
+            use_24_hour=lambda: True,
+            now=lambda: datetime(2026, 8, 7, 15, 22, 30, microsecond),
+            motion=lambda: motion,
+        )
+
+    def test_default_is_still(self):
+        self.assertEqual(sm.Config().clock_motion, "still")
+        self.assertEqual(sm.CLOCK_MOTIONS[0], "still")
+
+    def test_every_motion_is_accepted_by_config(self):
+        for motion in sm.CLOCK_MOTIONS:
+            with self.subTest(motion=motion):
+                self.assertEqual(sm.coerce_config({"clock_motion": motion}).clock_motion, motion)
+
+    def test_unknown_motion_falls_back(self):
+        self.assertEqual(sm.coerce_config({"clock_motion": "strobe"}).clock_motion, "still")
+
+    # --- blink -------------------------------------------------------------------------
+
+    def test_blink_shows_the_colon_in_the_first_half_second(self):
+        self.assertEqual(self.scene("blink", 100_000).display_text(), "15:22")
+
+    def test_blink_hides_the_colon_in_the_second_half_second(self):
+        self.assertEqual(self.scene("blink", 700_000).display_text(), "15 22")
+
+    def test_blink_boundary_is_the_half_second(self):
+        self.assertIn(":", self.scene("blink", 499_999).display_text())
+        self.assertNotIn(":", self.scene("blink", 500_000).display_text())
+
+    def test_blink_does_not_shift_the_digits(self):
+        """The colon is swapped for a same-width space, not removed."""
+        on = sm.clock_text_mask(self.scene("blink", 0).display_text(), 2)
+        off = sm.clock_text_mask(self.scene("blink", 900_000).display_text(), 2)
+        self.assertEqual(on.width, off.width)
+
+    def test_other_motions_never_hide_the_colon(self):
+        for motion in ("still", "breathe"):
+            for microsecond in (0, 500_000, 900_000):
+                with self.subTest(motion=motion, microsecond=microsecond):
+                    self.assertIn(":", self.scene(motion, microsecond).display_text())
+
+    def test_blink_redraws_when_the_colon_changes(self):
+        on = self.scene("blink", 100_000).frame(0.0).tobytes()
+        off = self.scene("blink", 700_000).frame(0.0).tobytes()
+        self.assertNotEqual(on, off)
+
+    def test_blink_stays_full_brightness(self):
+        self.assertEqual(self.scene("blink", 0).ink(1.7), (255, 255, 255))
+
+    # --- breathe -----------------------------------------------------------------------
+
+    def test_still_and_blink_are_always_full_brightness(self):
+        for motion in ("still", "blink"):
+            with self.subTest(motion=motion):
+                scene = self.scene(motion)
+                self.assertEqual({scene.ink_step(t) for t in (0, 1, 2.5, 4)},
+                                 {sm.ClockScene.BREATHE_STEPS})
+
+    def test_breathe_varies_brightness(self):
+        scene = self.scene("breathe")
+        levels = {scene.ink_step(t / 10) for t in range(int(scene.BREATHE_SECONDS * 10))}
+        self.assertGreater(len(levels), 5, "should be a smooth ramp, not two states")
+
+    def test_breathe_peaks_at_full_and_never_goes_dark(self):
+        scene = self.scene("breathe")
+        steps = [scene.ink_step(t / 20) for t in range(int(scene.BREATHE_SECONDS * 20) + 1)]
+        self.assertEqual(max(steps), scene.BREATHE_STEPS)
+        floor = round(scene.BREATHE_FLOOR * scene.BREATHE_STEPS)
+        self.assertGreaterEqual(min(steps), floor, "the time must stay readable at the dimmest")
+
+    def test_breathe_is_periodic(self):
+        scene = self.scene("breathe")
+        for t in (0.0, 0.7, 1.9, 3.3):
+            with self.subTest(t=t):
+                self.assertEqual(scene.ink_step(t), scene.ink_step(t + scene.BREATHE_SECONDS))
+
+    def test_breathe_eases_symmetrically(self):
+        """A cosine, so it slows at both ends rather than sawtoothing."""
+        scene = self.scene("breathe")
+        for t in (0.4, 1.1, 2.0):
+            with self.subTest(t=t):
+                self.assertEqual(scene.ink_step(t), scene.ink_step(scene.BREATHE_SECONDS - t))
+
+    def test_breathe_dims_the_rendered_digits(self):
+        scene = self.scene("breathe")
+        bright = scene.frame(0.0).getextrema()[0][1]
+        dim = scene.frame(scene.BREATHE_SECONDS / 2).getextrema()[0][1]
+        self.assertGreater(bright, dim)
+
+    def test_breathe_quantises_so_frames_stay_cacheable(self):
+        scene = self.scene("breathe")
+        renders = []
+        original = sm.draw_clock_text
+        try:
+            sm.draw_clock_text = lambda *a, **k: renders.append(1) or original(*a, **k)
+            for step in range(100):  # 5 s at 20 fps
+                scene.frame(step / 20)
+        finally:
+            sm.draw_clock_text = original
+        self.assertLess(len(renders), 50, "must not redraw every single frame")
+        self.assertGreater(len(renders), 5, "but must actually animate")
+
+    # --- over photos -------------------------------------------------------------------
+
+    def test_blink_applies_over_a_photo(self):
+        library = mock.Mock()
+        library.current.return_value = art_image((255, 255, 255), (64, 64))
+        on = sm.PhotoScene(library, 64, clock=self.scene("blink", 0)).frame(0.0).tobytes()
+        off = sm.PhotoScene(library, 64, clock=self.scene("blink", 900_000)).frame(0.0).tobytes()
+        self.assertNotEqual(on, off)
+
+    def test_breathe_applies_over_a_photo(self):
+        library = mock.Mock()
+        library.current.return_value = art_image((0, 0, 0), (64, 64))
+        scene = sm.PhotoScene(library, 64, clock=self.scene("breathe"))
+        bright = scene.frame(0.0).getextrema()[0][1]
+        dim = scene.frame(sm.ClockScene.BREATHE_SECONDS / 2).getextrema()[0][1]
+        self.assertGreater(bright, dim)
+
+
+class TestClockMotionWiring(unittest.TestCase):
+    def parse(self, argv):
+        return sm.build_parser().parse_args(argv)
+
+    def test_flag_maps_to_config(self):
+        self.assertEqual(
+            sm.config_overrides_from(self.parse(["--clock-motion", "breathe"])),
+            {"clock_motion": "breathe"},
+        )
+
+    def test_flag_accepts_every_motion(self):
+        action = next(a for a in sm.build_parser()._actions if a.dest == "clock_motion")
+        self.assertEqual(set(action.choices), set(sm.CLOCK_MOTIONS))
+
+    def test_flag_defaults_to_leaving_config_alone(self):
+        self.assertIsNone(self.parse([]).clock_motion)
+
+    def test_build_scenes_reads_motion_from_config(self):
+        store = stub_config(clock_motion="blink", clock_24_hour=True)
+        library = sm.PhotoLibrary(Path("/nonexistent"), 64, seconds=lambda: 30.0)
+        scenes = sm.build_scenes(
+            64, store, library, now=lambda: datetime(2026, 8, 7, 15, 22, 30, 900_000)
+        )
+        self.assertEqual(scenes["clock"].display_text(), "15 22")
+
+    def test_motion_change_takes_effect_without_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            store = sm.ConfigStore(path)
+            store.save(sm.Config(clock_motion="still"))
+            scenes = sm.build_scenes(
+                64, store, sm.PhotoLibrary(Path("/nonexistent"), 64, seconds=lambda: 30.0),
+                now=lambda: datetime(2026, 8, 7, 15, 22, 30, 900_000),
+            )
+            self.assertIn(":", scenes["clock"].display_text())
+            store.update({"clock_motion": "blink"})
+            self.assertNotIn(":", scenes["clock"].display_text())
 
 
 class TestPhotoScene(PhotoFixture):

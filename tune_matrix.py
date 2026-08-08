@@ -6,6 +6,7 @@ import base64
 import contextlib
 from io import BytesIO
 import json
+import math
 import os
 import secrets
 import shutil
@@ -273,6 +274,9 @@ class InMemoryTokenStore:
 
 
 SCENE_NAMES = ("album", "blank", "clock", "photos", "photos+clock")
+# How the clock moves. "still" is the default: a wall display that pulses when you did not
+# ask it to is annoying, not alive.
+CLOCK_MOTIONS = ("still", "blink", "breathe")
 
 
 @dataclass(frozen=True)
@@ -283,6 +287,7 @@ class Config:
     rpm: float = 20.0
     brightness: int | None = None
     clock_24_hour: bool = False
+    clock_motion: str = "still"
     photo_seconds: float = 30.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -293,6 +298,7 @@ class Config:
             "rpm": self.rpm,
             "brightness": self.brightness,
             "clock_24_hour": self.clock_24_hour,
+            "clock_motion": self.clock_motion,
             "photo_seconds": self.photo_seconds,
         }
 
@@ -339,6 +345,7 @@ def coerce_config(values: dict[str, Any], defaults: Config | None = None) -> Con
         rpm=number("rpm", base.rpm, 0.1, 300.0),
         brightness=brightness,
         clock_24_hour=bool(values.get("clock_24_hour", base.clock_24_hour)),
+        clock_motion=choice("clock_motion", CLOCK_MOTIONS, base.clock_motion),
         photo_seconds=number("photo_seconds", base.photo_seconds, 1.0, 3600.0),
     )
 
@@ -1916,29 +1923,69 @@ class BlankScene:
 
 
 class ClockScene:
+    """The time, optionally moving.
+
+    Three motions, none of them on by default:
+
+    - `still`: redrawn only when the minute changes.
+    - `blink`: the colon alternates each half second, like a bedside clock. It is swapped
+      for a space, which is the same width, so the digits never shift.
+    - `breathe`: the digits fade between dim and full over `BREATHE_SECONDS`. Brightness is
+      quantised so the rendered frame can still be cached instead of redrawn 20x a second.
+    """
+
+    BREATHE_SECONDS = 5.0
+    BREATHE_FLOOR = 0.35  # never fully dark; the time should stay readable throughout
+    BREATHE_STEPS = 24
+
     def __init__(
         self,
         size: int,
         use_24_hour: Callable[[], bool],
         now: Callable[[], datetime] = datetime.now,
+        motion: Callable[[], str] = lambda: "still",
     ) -> None:
         self.size = size
         self.use_24_hour = use_24_hour
+        self.motion = motion
         self._now = now
-        self._cache: tuple[str, Image.Image] | None = None
+        self._cache: tuple[str, int, Image.Image] | None = None
 
     def text(self) -> str:
         return format_clock(self._now(), self.use_24_hour())
 
-    def frame(self, now: float) -> Image.Image:
+    def display_text(self) -> str:
+        """The time as drawn, with the colon blanked on the off half of a blink."""
         text = self.text()
-        # Re-render once a minute, not 20 times a second.
-        if self._cache and self._cache[0] == text:
-            return self._cache[1]
+        if self.motion() == "blink" and self._now().microsecond >= 500_000:
+            return text.replace(":", " ")
+        return text
+
+    def ink_step(self, now: float) -> int:
+        """Quantised brightness, 0..BREATHE_STEPS, so frames stay cacheable."""
+        if self.motion() != "breathe":
+            return self.BREATHE_STEPS
+        # cos gives a symmetric ease at both ends, which reads as breathing rather than
+        # as a sawtooth ramp.
+        phase = (math.cos(2 * math.pi * now / self.BREATHE_SECONDS) + 1) / 2
+        level = self.BREATHE_FLOOR + (1 - self.BREATHE_FLOOR) * phase
+        return round(level * self.BREATHE_STEPS)
+
+    def ink(self, now: float) -> tuple[int, int, int]:
+        value = round(255 * self.ink_step(now) / self.BREATHE_STEPS)
+        return (value, value, value)
+
+    def frame(self, now: float) -> Image.Image:
+        text = self.display_text()
+        step = self.ink_step(now)
+        if self._cache and self._cache[0] == text and self._cache[1] == step:
+            return self._cache[2]
 
         frame = Image.new("RGB", (self.size, self.size), (0, 0, 0))
-        draw_clock_text(frame, text, clock_scale_for(self.size, text), outline=None)
-        self._cache = (text, frame)
+        draw_clock_text(
+            frame, text, clock_scale_for(self.size, text), colour=self.ink(now), outline=None
+        )
+        self._cache = (text, step, frame)
         return frame
 
 
@@ -1965,12 +2012,14 @@ class PhotoScene:
             return photo
 
         frame = photo.copy()
-        text = self.clock.text()
-        # A quarter from the bottom, so faces in the middle stay visible.
+        text = self.clock.display_text()
+        # A quarter from the bottom, so faces in the middle stay visible. The outline stays
+        # on here: the photo underneath can be any colour.
         draw_clock_text(
             frame,
             text,
             max(1, clock_scale_for(self.size, text) - 1),
+            colour=self.clock.ink(now),
             centre_y=int(self.size * 0.78),
         )
         return frame
@@ -2046,7 +2095,12 @@ def build_scenes(
     library: PhotoLibrary,
     now: Callable[[], datetime] = datetime.now,
 ) -> dict[str, Scene]:
-    clock = ClockScene(size, use_24_hour=lambda: config_store.current().clock_24_hour, now=now)
+    clock = ClockScene(
+        size,
+        use_24_hour=lambda: config_store.current().clock_24_hour,
+        now=now,
+        motion=lambda: config_store.current().clock_motion,
+    )
     return {
         "blank": BlankScene(size),
         "clock": clock,
@@ -2217,6 +2271,7 @@ CONFIGURABLE_FLAGS = {
     "idle_scene": "idle_scene",
     "rpm": "rpm",
     "clock_24_hour": "clock_24_hour",
+    "clock_motion": "clock_motion",
     "photo_seconds": "photo_seconds",
 }
 
@@ -2293,6 +2348,7 @@ def control_status(
         "photo_count": len(library.available()),
         "scenes": list(SCENE_NAMES),
         "styles": list(RENDERER_STYLES),
+        "motions": list(CLOCK_MOTIONS),
     }
 
 
@@ -2380,6 +2436,9 @@ CONTROL_PAGE = """<!doctype html>
     box-shadow:0 0 0 3px var(--glow), var(--shadow);
   }
   .seg button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  /* An odd number of options would leave the last one alone in a half-width cell. Let it
+     span instead, which reads as deliberate rather than as a layout accident. */
+  .seg button:last-child:nth-child(odd) { grid-column:1 / -1; }
 
   .slider { display:block; margin:0 0 1.1rem; }
   .slider-label { display:flex; justify-content:space-between; align-items:baseline;
@@ -2420,6 +2479,7 @@ CONTROL_PAGE = """<!doctype html>
 <section class="group">
   <h2>Clock</h2>
   <div class="seg" id="clockfmt"></div>
+  <div class="seg" id="clockmotion" style="margin-top:.35rem"></div>
 </section>
 
 <section class="group">
@@ -2444,10 +2504,11 @@ const $ = id => document.getElementById(id);
 const SCENE_LABEL = {album:"Album art", blank:"Off", clock:"Clock",
                      photos:"Photos", "photos+clock":"Photos + clock"};
 const STYLE_LABEL = {record:"Record", art:"Full frame"};
+const MOTION_LABEL = {still:"Still", blink:"Blink colon", breathe:"Breathe"};
 const SLIDERS = {brightness:v => v + "%", rpm:v => v + " rpm",
                  photo_seconds:v => v + "s"};
 const name = (map, key) => map[key] || key;
-let config = {}, meta = {scenes:[], styles:[]};
+let config = {}, meta = {scenes:[], styles:[], motions:[]};
 
 function segment(host, options, current, onPick) {
   host.replaceChildren(...options.map(([value, label]) => {
@@ -2470,6 +2531,8 @@ function paint() {
           config.idle_scene, v => save({idle_scene: v}));
   segment($("clockfmt"), [[false, "12 hour"], [true, "24 hour"]], config.clock_24_hour,
           v => save({clock_24_hour: v}));
+  segment($("clockmotion"), (meta.motions || []).map(m => [m, name(MOTION_LABEL, m)]),
+          config.clock_motion, v => save({clock_motion: v}));
   for (const key in SLIDERS) {
     const value = key === "brightness" ? (config.brightness ?? 65) : config[key];
     $(key).value = value;
@@ -2498,7 +2561,7 @@ for (const key in SLIDERS) {
 async function refresh() {
   try {
     const status = await (await fetch("/api/status")).json();
-    meta = {scenes: status.scenes, styles: status.styles};
+    meta = {scenes: status.scenes, styles: status.styles, motions: status.motions};
     const scene = name(SCENE_LABEL, status.scene);
     $("nowScene").textContent = status.scene === "album"
       ? `${scene} · ${name(STYLE_LABEL, config.style)}` : scene;
@@ -2864,6 +2927,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="Show a 24-hour clock instead of 12-hour."
+    )
+    parser.add_argument(
+        "--clock-motion",
+        choices=CLOCK_MOTIONS,
+        default=None,
+        help=(
+            "How the clock moves: 'still', 'blink' to flash the colon each half second, or "
+            "'breathe' to fade the digits in and out."
+        ),
     )
     parser.add_argument(
         "--web-port",
