@@ -16,9 +16,27 @@ Prices and stock were checked in **August 2026** and will drift. Everything link
 | Storage | 32GB **A1-rated** microSD (SanDisk Extreme, Samsung EVO Select) | ~$10 | anywhere |
 | Mounting | M3 nylon standoff + screw assortment | ~$6 | [Adafruit](https://www.adafruit.com/?q=m3+standoff) |
 
-**Total: ~$132.** Add an enclosure if you're not 3D printing one, and see below if you want USB-C power instead of the barrel jack.
-
 The panel and the bonnet both ship with the cables they need — the 16-pin IDC ribbon and the power pigtail with spade lugs come in the box. You don't buy those separately.
+
+## What it costs
+
+The seven parts above minus the power supply come to **$115.65**. What you add depends on how you want to power it:
+
+| Build | Power parts | **Total** |
+| --- | --- | --- |
+| Barrel jack — simplest | 5V 4A supply, $14.95 | **$130.60** |
+| USB-C at 3A — fewest parts, capped brightness | breakout + pigtail, ~$4 | **~$120** |
+| USB-C at full brightness — what TuneShine does | PD breakout + regulator + pigtail, $37.90 | **$153.55** |
+| USB-C, full brightness, generic regulator | same with a $5–10 buck instead of Pololu's | **~$130** |
+
+Both USB-C rows assume you already own a suitable charger and cable. If not, add ~$20 for a 30W brick.
+
+Not counted, because they depend on what you already have:
+
+- **Enclosure** — $0 if you 3D print it (a few dollars of filament), up to ~$30 for laser-cut acrylic or wood.
+- **A soldering iron** — you need one for the two bonnet mods below, and one of them is mandatory. If you don't own one, ~$25–40.
+
+**For comparison, [TuneShine sells for $199.99](https://store.tuneshine.rocks/products/tuneshine)** with the same 6.3" 64x64 panel, in a finished wood enclosure, with its own app and cloud service. So building it saves roughly **$50–80** — real, but not the reason to do it. You're doing it for the parts you get to choose: your own photos, your own idle scenes, no subscription, and a display you can change the behaviour of.
 
 ## Powering it over USB-C
 
@@ -34,12 +52,14 @@ Negotiate a **higher** voltage over USB-C, then convert it to 5V locally. This i
 
 | Part | What it does | Price | Where |
 | --- | --- | --- | --- |
-| USB-C PD sink breakout (HUSB238) | Negotiates 9V or 12V from the charger instead of 5V. Jumper-selectable. | ~$8 | [Adafruit 5807](https://www.adafruit.com/product/5807) |
-| 5V 5A step-down regulator | Converts that down to a solid 5V with 5A of headroom. Input range 6–38V, 85–95% efficient, with reverse-voltage, over-current, short-circuit and thermal protection built in. | ~$17 | [Pololu D24V50F5](https://www.pololu.com/product/2851) |
+| USB-C PD sink breakout (HUSB238) | Negotiates 9V or 12V from the charger instead of 5V. Jumper-selectable. Out of stock at Adafruit when checked; the [switchable version](https://www.adafruit.com/product/5991) does the same job with physical switches. | $5.95 | [Adafruit 5807](https://www.adafruit.com/product/5807) |
+| 5V 5A step-down regulator | Converts that down to a solid 5V with 5A of headroom. Input range 6–38V, 85–95% efficient, with reverse-voltage, over-current, short-circuit and thermal protection built in. | $29.95 | [Pololu D24V50F5](https://www.pololu.com/product/2851) |
 | Male 2.1mm barrel pigtail | Screw terminals on one end, a plug for the bonnet's jack on the other. | $2.00 | [Adafruit 369](https://www.adafruit.com/product/369) |
 | USB-C charger, 30W or better | Must actually offer 9V. A 30W phone charger or any USB-C laptop brick will. | — | you probably own one |
 
-Roughly **$27 of extra parts**, and you can drop the $14.95 barrel supply from the main list, so call it $12 net.
+**$37.90 of extra parts**, against the $14.95 barrel supply you no longer need — so about **$23 net** to move to USB-C.
+
+The regulator is most of that. Pololu's is the well-documented choice, with real protection circuitry and published efficiency curves. If $30 is too much for one part, a generic "DC-DC 5V 5A" module or an RC hobby UBEC does the same job for $5–10; you are trading documentation and protection for price, which is a reasonable trade in a box that already has a fused supply upstream.
 
 Wiring is a short chain: charger → USB-C cable → PD breakout (set to 9V) → regulator input → regulator 5V output → barrel pigtail → the bonnet's DC jack.
 
